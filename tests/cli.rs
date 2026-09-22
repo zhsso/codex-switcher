@@ -348,84 +348,70 @@ fn credentials_are_private_after_creation_and_replacement() {
 }
 
 #[test]
-fn status_handles_missing_managed_unmanaged_and_selected_accounts_read_only() {
+fn status_defaults_to_all_accounts_and_accepts_an_id() {
     let fixture = Fixture::new();
-    let snapshot: Value = serde_json::from_str(&fixture.ok(&["status", "--json"])).unwrap();
-    assert_eq!(snapshot["login_status"], "not_logged_in");
-    assert!(snapshot["account"].is_null());
+    assert_eq!(
+        serde_json::from_str::<Value>(&fixture.ok(&["status", "--json"])).unwrap(),
+        json!([])
+    );
     assert!(!fixture.storage().directory.exists());
-    fixture.key("saved", "sk-local-status-secret");
-    fixture.write_auth(&json!({"OPENAI_API_KEY": "sk-external-status-secret"}));
-    let before_store = fs::read(fixture.storage().directory.join("accounts.json")).unwrap();
-    let before_auth = fs::read(fixture.storage().auth_path()).unwrap();
-    let output = fixture.ok(&["status", "--json"]);
-    let snapshot: Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(snapshot["login_status"], "unmanaged");
-    assert!(snapshot["account"]["id"].is_null());
-    assert_eq!(snapshot["account"]["credential_status"], "api_key_present");
-    assert!(!output.contains("sk-external-status-secret"));
+    fixture.key("one", "sk-one-secret");
+    fixture.key("two", "sk-two-secret");
+    let rows: Value = serde_json::from_str(&fixture.ok(&["status", "--json"])).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+    assert_eq!(rows[0]["status"], "unsupported");
+    assert!(rows[0]["windows"].as_array().unwrap().is_empty());
     let selected: Value =
-        serde_json::from_str(&fixture.ok(&["status", "saved", "--json"])).unwrap();
-    assert_eq!(selected["account"]["name"], "saved");
-    assert_eq!(selected["account"]["is_active"], false);
+        serde_json::from_str(&fixture.ok(&["status", rows[1]["id"].as_str().unwrap(), "--json"]))
+            .unwrap();
+    assert_eq!(selected.as_array().unwrap().len(), 1);
+    assert_eq!(selected[0]["name"], "two");
     assert!(!fixture.run(&["status", "unknown"]).status.success());
-    for args in [
-        vec!["status"],
-        vec!["status", "saved"],
-        vec!["list"],
-        vec!["list", "--json"],
-    ] {
-        let output = fixture.ok(&args);
-        assert!(!output.contains("sk-local-status-secret"));
-        assert!(!output.contains("sk-external-status-secret"));
-    }
-    assert_eq!(
-        fs::read(fixture.storage().directory.join("accounts.json")).unwrap(),
-        before_store
-    );
-    assert_eq!(
-        fs::read(fixture.storage().auth_path()).unwrap(),
-        before_auth
-    );
-    fixture.ok(&["switch", "saved"]);
-    let snapshot: Value = serde_json::from_str(&fixture.ok(&["status", "--json"])).unwrap();
-    assert_eq!(snapshot["login_status"], "managed");
-    assert_eq!(snapshot["account"]["name"], "saved");
-    assert_eq!(snapshot["account"]["is_active"], true);
-    assert!(snapshot["account"]["last_used_at"].is_string());
+    let output = fixture.ok(&["status"]);
+    assert!(output.contains("unavailable for API key"));
+    assert!(!output.contains("sk-one-secret"));
+    assert!(!output.contains("sk-two-secret"));
 }
 
 #[test]
-fn status_uses_live_oauth_expiry_without_refreshing_or_exposing_tokens() {
+fn status_uses_official_codex_api_route_and_auth_headers_for_custom_backend() {
     let fixture = Fixture::new();
-    fixture.write_auth(&oauth_auth("status-account", "original"));
-    fixture.ok(&["add", "oauth"]);
-    let mut live = oauth_auth("status-account", "rotated");
-    let payload = json!({"exp": 1, "email": "status-account@example.com",
-        "https://api.openai.com/auth": {"chatgpt_account_id": "status-account", "chatgpt_plan_type": "plus"}});
-    live["tokens"]["id_token"] = json!(format!(
-        "header.{}.rotated",
-        URL_SAFE_NO_PAD.encode(payload.to_string())
-    ));
-    fixture.write_auth(&live);
-    let before = fs::read(fixture.storage().directory.join("accounts.json")).unwrap();
-    let output = fixture.ok(&["status", "--json"]);
-    let snapshot: Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(snapshot["account"]["credential_status"], "expired");
-    assert_eq!(snapshot["account"]["plan_type"], "plus");
-    assert_eq!(snapshot["account"]["refresh_token_present"], true);
-    assert_eq!(
-        snapshot["account"]["id_token_expires_at"],
-        "1970-01-01T00:00:01Z"
+    fixture.write_auth(&oauth_auth("workspace-official", "official"));
+    fixture.ok(&["add", "official"]);
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", server.server_addr());
+    let worker = std::thread::spawn(move || {
+        let request = server
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.url(), "/api/codex/usage");
+        let header = |name: &'static str| {
+            request
+                .headers()
+                .iter()
+                .find(|header| header.field.equiv(name))
+                .map(|header| header.value.as_str())
+        };
+        assert_eq!(header("authorization"), Some("Bearer access-official"));
+        assert_eq!(header("chatgpt-account-id"), Some("workspace-official"));
+        assert_eq!(header("user-agent"), Some("codex-cli"));
+        assert!(header("origin").is_none());
+        assert!(header("referer").is_none());
+        request.respond(tiny_http::Response::from_string(r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":12,"limit_window_seconds":18000,"reset_after_seconds":600}}}"#)).unwrap();
+    });
+    let output = fixture
+        .command(&["status", "official", "--base-url", &base_url, "--json"])
+        .env("NO_PROXY", "127.0.0.1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(fixture.list()[0]["credential_status"], "expired");
-    assert!(fixture.ok(&["list"]).contains("expired"));
-    assert!(!output.contains("refresh-rotated"));
-    assert!(!output.contains("access-rotated"));
-    assert!(!output.contains(live["tokens"]["id_token"].as_str().unwrap()));
-    assert_eq!(fixture.auth(), live);
-    assert_eq!(
-        fs::read(fixture.storage().directory.join("accounts.json")).unwrap(),
-        before
-    );
+    worker.join().unwrap();
+    let rows: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows[0]["windows"][0]["used_percent"], 12.0);
+    assert_eq!(rows[0]["windows"][0]["resets_in_seconds"], 600);
 }

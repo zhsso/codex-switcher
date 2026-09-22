@@ -1,10 +1,8 @@
 //! Local status snapshots. Never refresh credentials or serialize secrets.
-use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use std::path::PathBuf;
 
-use crate::{accounts, auth::refresh::parse_jwt_exp, storage::Storage, types::*};
+use crate::{auth::refresh::parse_jwt_exp, types::*};
 
 #[derive(Debug, Serialize)]
 pub struct AccountStatus {
@@ -99,102 +97,6 @@ impl AccountStatus {
             AuthMode::ChatGPT => "ChatGPT OAuth",
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-pub struct Status {
-    pub login_status: &'static str,
-    pub saved_accounts: usize,
-    pub accounts_file: PathBuf,
-    pub auth_file: PathBuf,
-    pub last_refresh: Option<DateTime<Utc>>,
-    pub account: Option<AccountStatus>,
-}
-
-pub fn snapshot(storage: &Storage, selector: Option<&str>) -> Result<Status> {
-    let mut store = storage.load()?;
-    let auth = storage.read_auth()?;
-    accounts::reconcile(&mut store, auth.as_ref());
-    let now = Utc::now().timestamp();
-    let live = auth.as_ref().and_then(|auth| {
-        if let Some(key) = auth
-            .openai_api_key
-            .as_ref()
-            .filter(|key| !key.trim().is_empty())
-        {
-            Some(AuthData::ApiKey { key: key.clone() })
-        } else {
-            auth.tokens.as_ref().map(|tokens| AuthData::ChatGPT {
-                id_token: tokens.id_token.clone(),
-                access_token: tokens.access_token.clone(),
-                refresh_token: tokens.refresh_token.clone(),
-                account_id: tokens.account_id.clone(),
-            })
-        }
-    });
-    let active = store.active_account_id.as_deref();
-    let account = if let Some(selector) = selector {
-        Some(AccountStatus::from_stored(
-            &store.accounts[accounts::resolve(&store, selector)?],
-            active,
-            now,
-        ))
-    } else if let Some(id) = active {
-        Some(AccountStatus::from_stored(
-            &store.accounts[accounts::resolve(&store, id)?],
-            active,
-            now,
-        ))
-    } else {
-        live.as_ref().map(|data| {
-            let mut account = AccountStatus::from_credentials(data, now);
-            account.is_active = true;
-            account
-        })
-    };
-    Ok(Status {
-        login_status: if active.is_some() {
-            "managed"
-        } else if live.is_some() {
-            "unmanaged"
-        } else {
-            "not_logged_in"
-        },
-        saved_accounts: store.accounts.len(),
-        accounts_file: storage.directory.join("accounts.json"),
-        auth_file: storage.auth_path(),
-        last_refresh: auth.and_then(|auth| auth.last_refresh),
-        account,
-    })
-}
-
-pub fn print_account(account: &AccountStatus) {
-    println!(
-        "Account:     {:?}",
-        account.name.as_deref().unwrap_or("(not saved)")
-    );
-    println!("ID:          {}", account.id.as_deref().unwrap_or("-"));
-    println!("Active:      {}", account.is_active);
-    println!("Email:       {:?}", account.email.as_deref().unwrap_or("-"));
-    println!(
-        "Plan (local): {:?}",
-        account.plan_type.as_deref().unwrap_or("unknown")
-    );
-    println!("Auth:        {}", account.auth_label());
-    println!("Credentials: {}", account.credential_status);
-    println!("ID expires:  {}", format_time(account.id_token_expires_at));
-    println!(
-        "Access expires: {}",
-        format_time(account.access_token_expires_at)
-    );
-    println!("Refresh token present: {}", account.refresh_token_present);
-    println!("Added:       {}", format_time(account.created_at));
-    println!("Last used:   {}", format_time(account.last_used_at));
-}
-
-pub fn format_time(time: Option<DateTime<Utc>>) -> String {
-    time.map(|time| time.to_rfc3339())
-        .unwrap_or_else(|| "-".into())
 }
 
 #[cfg(test)]

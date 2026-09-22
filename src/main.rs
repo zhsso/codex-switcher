@@ -1,10 +1,10 @@
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
-use codex_switcher::{accounts, auth, status, storage::Storage, types::StoredAccount};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use codex_switcher::{accounts, auth, status, storage::Storage, types::StoredAccount, usage};
 
 #[derive(Parser)]
 #[command(
@@ -13,6 +13,9 @@ use codex_switcher::{accounts, auth, status, storage::Storage, types::StoredAcco
     after_help = "Account selectors accept an exact name or full ID. Use `list` to see saved accounts."
 )]
 struct Cli {
+    /// Terminal colors; auto respects NO_COLOR and disables colors in pipes
+    #[arg(long, global = true, value_enum, default_value = "auto")]
+    color: ColorMode,
     /// Account storage directory (default: ~/.codex-switcher)
     #[arg(long, global = true)]
     store_dir: Option<PathBuf>,
@@ -21,6 +24,13 @@ struct Cli {
     codex_home: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ColorMode {
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Subcommand)]
@@ -50,11 +60,14 @@ enum Command {
     },
     /// Save the live session, refresh the target if needed, and write auth.json
     Switch { account: String },
-    /// Show local login status or details for a saved account (no network requests)
+    /// Fetch usage and reset times for an account, or all saved accounts
     Status {
         account: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Backend base URL receiving the account token (Codex path selection)
+        #[arg(long, default_value = usage::DEFAULT_BASE_URL)]
+        base_url: String,
     },
     /// Show saved accounts without credentials or network requests
     List {
@@ -100,6 +113,17 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    let theme = codex_switcher::output::Theme {
+        color: match cli.color {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => {
+                io::stdout().is_terminal()
+                    && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+                    && std::env::var("TERM").as_deref() != Ok("dumb")
+            }
+        },
+    };
     let storage = Storage::new(cli.store_dir, cli.codex_home)?;
     match cli.command {
         Command::Add {
@@ -169,28 +193,21 @@ async fn run(cli: Cli) -> Result<()> {
             "Switched to {}",
             accounts::switch(&storage, &account).await?
         ),
-        Command::Status { account, json } => {
-            let snapshot = status::snapshot(&storage, account.as_deref())?;
+        Command::Status {
+            account,
+            json,
+            base_url,
+        } => {
+            let report = usage::query(&storage, account.as_deref(), &base_url).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("Login:       {}", snapshot.login_status);
-                println!("Saved accounts: {}", snapshot.saved_accounts);
-                println!("Accounts file: {}", snapshot.accounts_file.display());
-                println!("Auth file:     {}", snapshot.auth_file.display());
-                println!(
-                    "Live auth last refresh: {}",
-                    status::format_time(snapshot.last_refresh)
-                );
-                if let Some(account) = &snapshot.account {
-                    status::print_account(account);
-                } else {
-                    println!(
-                        "No local login. Add an account and run `codex-switcher switch NAME`."
-                    );
-                }
-                println!("Local snapshot only; API keys and server sessions are not verified. Plan information may be stale.");
+                print!("{}", theme.usage(&report));
             }
+            anyhow::ensure!(
+                !report.iter().any(|row| row.status == "error"),
+                "Some usage queries failed; see per-account errors above"
+            );
         }
         Command::List { json } => {
             let store = accounts::load_current(&storage)?;
@@ -208,23 +225,8 @@ async fn run(cli: Cli) -> Result<()> {
                 .collect();
             if json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
-            } else if rows.is_empty() {
-                println!("No saved accounts. Run `codex-switcher add NAME` or `codex-switcher add NAME --login`.");
             } else {
-                println!("  ID                                    AUTH           CREDENTIALS       NAME / EMAIL / PLAN (local)");
-                for account in &rows {
-                    let marker = if account.is_active { '*' } else { ' ' };
-                    println!(
-                        "{marker} {}  {:<14} {:<17} {:?} / {:?} / {:?}",
-                        account.id.as_deref().unwrap_or("-"),
-                        account.auth_label(),
-                        account.credential_status,
-                        account.name.as_deref().unwrap_or("-"),
-                        account.email.as_deref().unwrap_or("-"),
-                        account.plan_type.as_deref().unwrap_or("unknown")
-                    );
-                }
-                println!("* Current account. Credential status is based on local files, not server verification.");
+                print!("{}", theme.accounts(&rows));
             }
         }
     }

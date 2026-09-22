@@ -413,6 +413,18 @@ mod tests {
         )
         .await;
         assert!(result.err().unwrap().to_string().contains("cancelled"));
-        assert!(Server::http(address).is_ok());
+        // tiny_http wakes its accept thread in Drop without joining it.
+        // Allow that thread to release the socket before rebinding.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if Server::http(address).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "callback listener was not released"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

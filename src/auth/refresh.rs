@@ -1,4 +1,4 @@
-//! On-demand refresh, called only by an explicit account switch.
+//! On-demand refresh for account switching and explicit usage queries.
 use crate::types::{parse_chatgpt_id_token_claims, AuthData, StoredAccount};
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -31,7 +31,15 @@ struct TokenRefreshUpdate {
 pub async fn refresh_if_needed(
     account: &StoredAccount,
 ) -> Result<(StoredAccount, Option<anyhow::Error>)> {
-    if !chatgpt_tokens_need_refresh(account) {
+    refresh_account(account, false, DEFAULT_ISSUER).await
+}
+
+pub(crate) async fn refresh_account(
+    account: &StoredAccount,
+    force: bool,
+    issuer: &str,
+) -> Result<(StoredAccount, Option<anyhow::Error>)> {
+    if !force && !chatgpt_tokens_need_refresh(account) {
         return Ok((account.clone(), None));
     }
     let AuthData::ChatGPT {
@@ -47,7 +55,7 @@ pub async fn refresh_if_needed(
         !refresh_token.is_empty(),
         "Missing refresh token; add this account again with --login"
     );
-    let response = refresh_tokens_with_refresh_token(refresh_token).await?;
+    let response = refresh_tokens_with_refresh_token(refresh_token, issuer).await?;
     let next = merge_refresh_response(
         id_token.clone(),
         refresh_token.clone(),
@@ -150,7 +158,10 @@ pub(crate) fn parse_jwt_exp(token: &str) -> Option<i64> {
     json.get("exp").and_then(|v| v.as_i64())
 }
 
-async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<RefreshTokenResponse> {
+async fn refresh_tokens_with_refresh_token(
+    refresh_token: &str,
+    issuer: &str,
+) -> Result<RefreshTokenResponse> {
     let client = reqwest::Client::new();
     let body = format!(
         "grant_type=refresh_token&refresh_token={}&client_id={}",
@@ -163,7 +174,7 @@ async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<Refres
 
     for attempt in 1..=3u8 {
         match client
-            .post(format!("{DEFAULT_ISSUER}/oauth/token"))
+            .post(format!("{issuer}/oauth/token"))
             .timeout(Duration::from_secs(10))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body.clone())
