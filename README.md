@@ -1,218 +1,102 @@
-<p align="center">
-  <img src="src-tauri/icons/logo.svg" alt="Codex Switcher" width="128" height="128">
-</p>
+# Codex Switcher CLI
 
-<h1 align="center">Codex Switcher</h1>
+一个独立的 Rust 命令行账号管理工具，提供 `add`、`remove`、`edit`、`switch`，以及用于查看账号列表与本地登录状态的 `list`、`status`。
 
-<p align="center">
-  A Desktop Application for Managing Multiple OpenAI <a href="https://github.com/openai/codex">Codex</a> Accounts<br>
-  Easily switch between accounts, monitor usage, schedule warm-ups, and stay in control of your quota
-</p>
+已移除 Tauri/React GUI、Web UI、托盘、用量与进程监控、自动预热和自动更新。无需 Node.js、pnpm 或桌面环境，不运行后台服务。
 
-<div align="center">
+## 安装
 
-[![](https://dcbadge.limes.pink/api/server/4QzyJTC3S)](https://discord.gg/4QzyJTC3S)
+需要 Rust 1.89 或更新版本：
 
-</div>
-
-## Features
-
-- **Multi-Account Management** – Add, rename, mask, import, export, and manage multiple Codex accounts in one place
-- **Quick Switching** – Switch between accounts from the main window, native tray menu, or tray popup while preserving rotated ChatGPT sessions
-- **Usage Stats** – View account usage stats for OAuth accounts, including lifetime tokens, daily buckets, streaks, activity insights, and top integrations
-- **Manual Reset Credits** – See available manual reset credits beside each account plan badge, with the closest expiry highlighted as it approaches
-- **Automatic Warm-Up** – Warm up one account or all accounts manually, after each 5-hour reset window, or at specific scheduled times of day
-- **System Tray Controls** – Use the tray popup to switch accounts, inspect quota and active-account stats, refresh usage, open the main window, or quit the app
-- **Tray Display Modes** – Choose between the app icon with session percentage, a text-only hourly/weekly percentage display, or a hidden tray icon
-- **macOS Dock Control** – Keep Codex Switcher in the Dock or run it as a menu bar only app, with a first-close prompt and a tray fallback
-- **Rate-Limit Monitoring** – View real-time 5-hour session and weekly usage, reset timing, credits, and subscription expiry
-- **Blocked Switch Recovery** – Detect running Codex sessions and offer a force-close flow before retrying the account switch
-- **Dual Login Mode** – Authenticate with ChatGPT OAuth or import existing `auth.json` files
-
-## Installation
-
-### Download a Release
-
-The easiest way to install Codex Switcher is from the latest GitHub release:
-
-[Download the latest release](https://github.com/Lampese/codex-switcher/releases/latest)
-
-Choose the file for your platform:
-
-- **macOS Apple Silicon:** `Codex.Switcher_*_aarch64.dmg`
-- **macOS Intel:** `Codex.Switcher_*_x64.dmg`
-- **Windows:** `Codex.Switcher_*_x64-setup.exe` or `Codex.Switcher_*_x64_en-US.msi`
-- **Linux Debian/Ubuntu:** `Codex.Switcher_*_amd64.deb`
-- **Linux AppImage:** `Codex.Switcher_*_amd64.AppImage`
-- **Linux RPM:** `Codex.Switcher-*-1.x86_64.rpm`
-
-> **macOS:** current release builds are not Apple-notarized. If macOS says the
-> app is damaged, move it to `/Applications` and remove the quarantine flag:
->
-> ```bash
-> sudo xattr -dr com.apple.quarantine "/Applications/Codex Switcher.app"
-> open "/Applications/Codex Switcher.app"
-> ```
-
-### Auto Updates
-
-Codex Switcher checks the latest GitHub release on startup. When a newer signed
-update package is available, the app shows an update prompt and can install it
-from inside the app.
-
-### Build from Source
-
-#### Prerequisites
-
-- [Node.js](https://nodejs.org/) (v18+)
-- [pnpm](https://pnpm.io/)
-- [Rust](https://rustup.rs/)
-
-```bash
-# Clone the repository
-git clone https://github.com/Lampese/codex-switcher.git
-cd codex-switcher
-
-# Install dependencies
-pnpm install
-
-# Run in development mode
-pnpm tauri dev
-
-# Build for production
-pnpm tauri build
+```sh
+cargo install --path . --locked
+codex-switcher --help
 ```
 
-> **Windows:** the `pnpm tauri` script runs through a POSIX shell wrapper
-> (`sh ./scripts/tauri.sh`) and will not work in PowerShell/CMD. Use the
-> `tauri:win` script instead: `pnpm tauri:win dev` and `pnpm tauri:win build`.
+也可以在项目内运行：
 
-The built application will be in `src-tauri/target/release/bundle/`.
-
-### Run the Dashboard in a Browser
-
-You can also serve the built dashboard over HTTP instead of opening the Tauri shell.
-
-```bash
-# Build the frontend and start the web server on 0.0.0.0:3210
-pnpm lan
+```sh
+cargo run -- add personal
+cargo run -- list
+cargo build --release --locked
+# 可执行文件：target/release/codex-switcher（Windows 为 .exe）
 ```
 
-Optional environment variables:
+## 使用
 
-- `CODEX_SWITCHER_WEB_HOST` to override the bind host
-- `CODEX_SWITCHER_WEB_PORT` to override the port
+```sh
+# 保存当前 Codex auth.json 中的登录信息，不切换账号
+codex-switcher add personal
 
-The browser dashboard serves the same UI and backend actions through `/api/invoke/*`, which makes it usable over LAN, Tailscale, or a remote host tunnel when you expose the chosen port safely.
+# 从指定文件新增账号；省略名称时从邮箱或账号 ID 生成
+codex-switcher add work --file /path/to/auth.json
 
-## Usage and Reset Credits
+# 使用保留的 ChatGPT OAuth/PKCE 流程登录，完成后保存账号
+codex-switcher add work --login
+# 不自动打开浏览器，手动访问终端输出的地址
+codex-switcher add work --login --no-browser
 
-Codex Switcher shows two kinds of account usage information:
+# 从标准输入读取 API key，避免作为命令参数传递
+codex-switcher add api --api-key-stdin < /path/to/api-key.txt
 
-- **Rate limits** – the account card shows the current 5-hour and weekly limit
-  windows, remaining percentage, reset timing, credit balance, and subscription
-  expiry when available.
-- **Usage Stats** – ChatGPT OAuth accounts can expand the **Usage
-  Stats** panel to view stats such as lifetime tokens,
-  today, last 7 days, last 30 days, streaks, longest task, token activity,
-  reasoning/activity insights, and most-used integrations. The active account
-  opens this panel by default; other accounts keep it collapsed until needed.
-- **Manual reset credits** – OAuth accounts with available reset credits show a
-  compact badge next to the plan badge. It includes the available count and the
-  closest expiry date, hides zero-count results, and turns amber within 10 days
-  or red within 3 days of expiry.
+# 查看账号，* 表示当前 auth.json 对应的账号
+codex-switcher list
+codex-switcher list --json
 
-The tray popup also includes compact active-account stats for today and
-the last 7 days, while keeping the normal rate-limit refresh flow separate.
+# 按精确名称或完整 ID 切换
+codex-switcher switch work
 
-## Safe Account Switching
+# 修改名称、替换凭据，或同时修改
+codex-switcher edit work --name company
+codex-switcher edit company --file /path/to/new-auth.json
+codex-switcher edit api --api-key-stdin < /path/to/new-api-key.txt
 
-ChatGPT can replace an OAuth refresh token after using it. Once replaced, the
-older token may no longer be accepted. Before Codex Switcher writes another
-account to `~/.codex/auth.json`, it now saves the latest tokens from the account
-that is currently active. Switching back therefore restores the current session
-instead of an older snapshot.
-
-Token refreshes and account switches are serialized so a background refresh
-cannot finish late and overwrite the account you just selected. Codex Switcher
-also avoids refreshing the active account while Codex or ChatGPT is running;
-close the running app before switching accounts.
-
-If an older Codex Switcher version already saved an invalid refresh token, sign
-in to that account again or remove and re-add it once. An invalidated token
-cannot be recovered locally.
-
-## macOS Dock and Menu Bar Mode
-
-On macOS, Codex Switcher can either stay visible in the Dock or live only in the
-menu bar. The first time you close the main window, the app asks which behavior
-you want and lets you choose whether to show that prompt again.
-
-You can change the same setting later from the tray popup or from the native
-tray menu under **Dock Icon**. If you choose **Menu Bar Only**, the app keeps a
-visible tray item so you can always reopen the main window or switch back to
-Dock mode.
-
-## Warm-Up
-
-A warm-up sends one minimal request to an account so its current usage window
-has activity before you need it.
-
-- **Manual** – warm up a single or all accounts, from the main window or tray menu.
-- **Automatic** – when enabled (per account or for all), the app tracks the
-  5-hour window when available and warms it after each reset, as long as the
-  weekly limit isn't exhausted. If only the weekly window is available, it
-  warms once after the weekly reset and automatically returns to the 5-hour
-  schedule if that window reappears.
-- **Timed** – pick specific times of day (e.g. `08:00`, `13:00`, `18:00`) from
-  the **Timed** control in the main window. At each time the app warms all
-  accounts (skipping any whose weekly limit is exhausted), so you control when
-  your 5-hour windows start instead of letting them drift.
-
-Timed warm-up checks the schedule every 30 seconds, runs each configured minute
-only once per day, and skips missed times if the machine was asleep instead of
-warming accounts late.
-
-On macOS you can keep the machine awake with the built-in `caffeinate` command,
-which stops automatically when the app quits:
-
-```bash
-caffeinate -i -w "$(pgrep -x 'Codex Switcher')"
+# 从保存的账号列表中删除，不登出 Codex，也不自动切换其他账号
+codex-switcher remove personal
 ```
 
-## Disclaimer
+`add` 不自动切换；需要激活新账号时显式运行 `switch`。`edit` 保留账号 ID、创建时间和使用记录；替换当前账号的凭据时也会更新当前 `auth.json`。重名、空名称、未知账号、无效认证文件和参数冲突会返回非零退出码。
 
-This tool is designed **exclusively for individuals who personally own multiple OpenAI/ChatGPT accounts**. It is intended to help users manage their own accounts more conveniently.
+OAuth 登录仅在命令执行期间启动本地回调监听器，默认端口为 `1455`，占用时选择空闲端口；等待最多五分钟，可用 Ctrl+C 取消。远程主机上的登录需要浏览器能够访问该主机的回调端口。
 
-**This tool is NOT intended for:**
+## 查看状态
 
-- Sharing accounts between multiple users
-- Circumventing OpenAI's terms of service
-- Any form of account pooling or credential sharing
-
-By using this software, you agree that you are the rightful owner of all accounts you add to the application. The authors are not responsible for any misuse or violations of OpenAI's terms of service.
-
-## Versioning
-
-Use the version bump helper to keep app versions in sync across Tauri, Cargo, and the frontend.
-
-```bash
-# Exact version
-pnpm version:bump 0.2.1
-
-# Semver bumps
-pnpm version:patch
-pnpm version:minor
-pnpm version:major
-
-# Prepare a release commit and tag
-# This prompts for a short release note and runs the version bump first.
-pnpm release patch
-
-# Prepare and push a release
-# The tag stores the release note for the in-app update prompt.
-pnpm release patch -- --push
-
-# For non-interactive use, pass the note explicitly.
-pnpm release patch -- --push --note "Fixed account switching issues"
+```sh
+codex-switcher status                 # 当前登录及本地凭据状态
+codex-switcher status company         # 指定名称或完整 ID 的账号详情
+codex-switcher status --json          # 供脚本读取的 JSON
+codex-switcher status company --json
+codex-switcher list                   # 列表中显示认证方式、凭据状态与本地套餐信息
 ```
+
+`status` 显示账号、邮箱、认证方式、本地套餐信息、ID/access token 的到期时间、是否保存 refresh token、添加与最近切换时间、账号文件与认证文件路径。`login_status` 描述当前本地登录：`managed` 表示匹配已保存账号，`unmanaged` 表示凭据未匹配账号库，`not_logged_in` 表示没有本地登录；指定账号时，`account` 是该账号详情，`is_active` 表示它是否为当前账号。
+
+凭据状态包括 `api_key_present`（API key 已配置）、`not_expired`（可解析的 token 尚未过期）、`expiring_soon`（60 秒内到期）、`expired`、`unknown`（无法判断到期时间）及 `missing`（缺少凭据）。这些状态仅根据本地文件计算，不验证服务端会话、API key 或 JWT 签名；无法解析的 token 到期时间显示为未知。本地套餐信息可能已过时，不表示实时订阅或额度。
+
+`status` 和 `list` 都只读本地文件，不刷新 token、不查询用量、不启动监控，也不输出密钥或 token。损坏或无法读取的文件会报错并返回非零退出码。
+
+## 数据与切换
+
+- 默认沿用原应用的 `~/.codex-switcher/accounts.json`，已有账号无需迁移。旧界面配置与监控缓存不再使用，也不会删除用户目录中的文件。
+- Codex 凭据写入 `$CODEX_HOME/auth.json`，未设置时使用 `~/.codex/auth.json`。
+- 切换前核对当前身份，并保存 Codex 已轮换的 OAuth token；仅在切换目标 token 即将过期或已过期时请求刷新。保存轮换后的 refresh token 后才报告无效 ID token 错误。
+- 账号命令使用文件锁避免同一账号库的并发写入；凭据文件采用原子替换，Unix 文件权限为 `0600`。
+- `list` 不发起网络请求、不输出 token 或 API key。账号文件本身仍包含明文凭据。
+- 切换通过写入文件生效；先退出正在使用该登录的 Codex 会话，切换后重新启动。CLI 不检测、终止或重启任何进程。
+
+可以显式指定隔离目录，参数可放在子命令前后：
+
+```sh
+codex-switcher --store-dir /path/to/profiles --codex-home /path/to/codex add personal
+codex-switcher --store-dir /path/to/profiles --codex-home /path/to/codex switch personal
+```
+
+## 开发
+
+```sh
+cargo fmt --check
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+```
+
+测试使用临时目录和虚构凭据，不修改实际账号或请求真实 OAuth token。
