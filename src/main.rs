@@ -59,7 +59,11 @@ enum Command {
         source: Source,
     },
     /// Save the live session, refresh the target if needed, and write auth.json
-    Switch { account: String },
+    Switch {
+        /// Exact name or full ID; multiple shell words are joined with spaces
+        #[arg(required = true, num_args = 1..)]
+        account: Vec<String>,
+    },
     /// Fetch usage and reset times for an account, or all saved accounts
     Status {
         account: Option<String>,
@@ -189,10 +193,13 @@ async fn run(cli: Cli) -> Result<()> {
                 accounts::edit(&storage, &account, name, replacement)?
             );
         }
-        Command::Switch { account } => println!(
-            "Switched to {}",
-            accounts::switch(&storage, &account).await?
-        ),
+        Command::Switch { account } => {
+            let selector = account.join(" ");
+            println!(
+                "Switched to {}",
+                accounts::switch(&storage, &selector).await?
+            )
+        }
         Command::Status {
             account,
             json,

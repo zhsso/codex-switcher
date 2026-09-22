@@ -129,6 +129,14 @@ fn account_lifecycle_by_name_and_id() {
 }
 
 #[test]
+fn switch_joins_unquoted_name_words() {
+    let fixture = Fixture::new();
+    fixture.key("So Zhang", "sk-space-name");
+    fixture.ok(&["switch", "So", "Zhang"]);
+    assert_eq!(fixture.auth()["OPENAI_API_KEY"], "sk-space-name");
+}
+
+#[test]
 fn imports_current_login_and_replaces_credentials_without_changing_identity() {
     let fixture = Fixture::new();
     fixture.write_auth(&json!({"OPENAI_API_KEY": "sk-initial"}));

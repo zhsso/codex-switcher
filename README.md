@@ -45,6 +45,7 @@ codex-switcher list --json
 
 # 按精确名称或完整 ID 切换
 codex-switcher switch work
+codex-switcher switch So Zhang       # 名称含空格时无需加引号
 
 # 修改名称、替换凭据，或同时修改
 codex-switcher edit work --name company
