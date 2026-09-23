@@ -1,16 +1,18 @@
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use codex_switcher::{accounts, auth, status, storage::Storage, types::StoredAccount, usage};
+use codex_switcher::{
+    accounts, auth, processes, status, storage::Storage, types::StoredAccount, usage,
+};
 
 #[derive(Parser)]
 #[command(
     version,
     about = "Manage and switch Codex accounts",
-    after_help = "Account selectors accept an exact name or full ID. Use `list` to see saved accounts."
+    after_help = "Account selectors accept an exact name or full ID. Use `list` (alias: `ls`) to see saved accounts."
 )]
 struct Cli {
     /// Terminal colors; auto respects NO_COLOR and disables colors in pipes
@@ -74,9 +76,18 @@ enum Command {
         base_url: String,
     },
     /// Show saved accounts without credentials or network requests
+    #[command(alias = "ls")]
     List {
         #[arg(long)]
         json: bool,
+    },
+    /// Show running Codex CLI, Codex desktop, and ChatGPT processes
+    Ps,
+    /// Gracefully close the listed Codex and ChatGPT processes
+    Stop {
+        /// Close without prompting for confirmation
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 
@@ -235,6 +246,34 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 print!("{}", theme.accounts(&rows));
             }
+        }
+        Command::Ps => {
+            let running = processes::list_running()?;
+            print!("{}", theme.processes(&running));
+        }
+        Command::Stop { yes } => {
+            let running = processes::list_running()?;
+            print!("{}", theme.processes(&running));
+            if running.is_empty() {
+                return Ok(());
+            }
+            if !yes {
+                anyhow::ensure!(
+                    io::stdin().is_terminal(),
+                    "confirmation requires a terminal; review with `codex-switcher ps` and use `stop --yes` to proceed"
+                );
+                io::stdout().flush()?;
+                eprint!("Close all listed processes? Unsaved work may be lost. [y/N] ");
+                io::stderr().flush()?;
+                let mut answer = String::new();
+                io::stdin().read_line(&mut answer)?;
+                if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+            }
+            let stopped = processes::stop(&running)?;
+            println!("Closed {} process(es).", stopped.len());
         }
     }
     Ok(())

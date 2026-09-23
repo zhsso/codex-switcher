@@ -129,6 +129,12 @@ fn account_lifecycle_by_name_and_id() {
 }
 
 #[test]
+fn ls_is_an_alias_for_list() {
+    let fixture = Fixture::new();
+    assert_eq!(fixture.ok(&["ls", "--json"]).trim(), "[]");
+}
+
+#[test]
 fn switch_joins_unquoted_name_words() {
     let fixture = Fixture::new();
     fixture.key("So Zhang", "sk-space-name");

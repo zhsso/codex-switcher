@@ -2,6 +2,7 @@
 pub mod accounts;
 pub mod auth;
 pub mod output;
+pub mod processes;
 pub mod status;
 pub mod storage;
 pub mod types;

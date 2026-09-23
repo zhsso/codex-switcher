@@ -2,7 +2,7 @@
 
 一个独立的 Rust 命令行账号管理工具，提供 `add`、`remove`、`edit`、`switch`，以及用于查看账号列表与实时用量的 `list`、`status`。
 
-已移除 Tauri/React GUI、Web UI、托盘、用量与进程监控、自动预热和自动更新。无需 Node.js、pnpm 或桌面环境，不运行后台服务。
+已移除 Tauri/React GUI、Web UI、托盘、后台进程监控、自动预热和自动更新。无需 Node.js、pnpm 或桌面环境，不运行后台服务；查看和关闭进程由 `ps`、`stop` 命令显式执行。
 
 ## 安装
 
@@ -42,6 +42,14 @@ codex-switcher add api --api-key-stdin < /path/to/api-key.txt
 # 查看账号，* 表示当前 auth.json 对应的账号
 codex-switcher list
 codex-switcher list --json
+codex-switcher ls                  # list 的别名
+
+# 查看运行中的 Codex CLI、Codex 桌面端和 ChatGPT
+codex-switcher ps
+
+# 先列出进程并确认后优雅关闭；-y/--yes 跳过确认
+codex-switcher stop
+codex-switcher stop --yes
 
 # 按精确名称或完整 ID 切换
 codex-switcher switch work
@@ -95,7 +103,7 @@ codex-switcher list --color never
 
 查询优先使用当前本地凭据；遇到 HTTP 401 时重新读取凭据，必要时刷新并保存 token 后重试一次。HTTP 403 不触发刷新。查询不会切换当前账号、启动后台监控或发送预热请求。仅当刷新的是当前账号时同步其 `auth.json`。
 
-`list` 保留本地凭据状态与本地套餐信息，不联网、不写入文件。`status` 和 `list` 均不输出密钥或 token。
+`list`（也可用 `ls`）保留本地凭据状态与本地套餐信息，不联网、不写入文件。`status` 和 `list` 均不输出密钥或 token。
 
 ## 数据与切换
 
@@ -104,7 +112,7 @@ codex-switcher list --color never
 - 切换前核对当前身份，并保存 Codex 已轮换的 OAuth token；切换目标 token 即将过期或已过期时请求刷新；显式用量查询遇到 HTTP 401 时也会按需刷新。保存轮换后的 refresh token 后才报告无效 ID token 错误。
 - 账号命令使用文件锁避免同一账号库的并发写入；凭据文件采用原子替换，Unix 文件权限为 `0600`。
 - `list` 不发起网络请求、不输出 token 或 API key。账号文件本身仍包含明文凭据。
-- 切换通过写入文件生效；先退出正在使用该登录的 Codex 会话，切换后重新启动。CLI 不检测、终止或重启任何进程。
+- 切换通过写入文件生效；先退出正在使用该登录的 Codex 会话，切换后重新启动。`switch` 不会自动检测或关闭进程；可先用 `ps` 检查，必要时运行 `stop`。`stop` 只针对列出的根进程请求优雅关闭，不强制结束仍在运行的进程。
 
 可以显式指定隔离目录，参数可放在子命令前后：
 

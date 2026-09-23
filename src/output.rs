@@ -3,7 +3,7 @@ use std::fmt::Write;
 
 use chrono::Local;
 
-use crate::{status::AccountStatus, usage::AccountUsage};
+use crate::{processes::RunningProcess, status::AccountStatus, usage::AccountUsage};
 
 pub struct Theme {
     pub color: bool,
@@ -166,6 +166,35 @@ impl Theme {
                 "37"
             )
         );
+        out
+    }
+
+    pub fn processes(&self, rows: &[RunningProcess]) -> String {
+        let mut out = format!(
+            "\n  {}  {}\n",
+            self.paint("Running processes", "1;96"),
+            self.paint(&format!("{} process(es)", rows.len()), "37")
+        );
+        if rows.is_empty() {
+            out.push_str("\n    No running Codex or ChatGPT processes found.\n\n");
+            return out;
+        }
+
+        let label_width = rows
+            .iter()
+            .map(|process| process.kind.label().len())
+            .max()
+            .unwrap_or(0);
+        for process in rows {
+            let label = format!("{:<label_width$}", process.kind.label());
+            let _ = writeln!(
+                out,
+                "    {}  {}",
+                self.paint(&label, "1;97"),
+                self.paint(&process.pid.to_string(), "93")
+            );
+        }
+        out.push('\n');
         out
     }
 }
