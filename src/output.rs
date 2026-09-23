@@ -47,9 +47,8 @@ impl Theme {
                 "\n{}",
                 self.heading(
                     &format!(
-                        "{}@{}({})",
+                        "{} ({})",
                         row.name,
-                        row.id,
                         row.plan_type.as_deref().unwrap_or("unknown")
                     ),
                     row.is_active,
