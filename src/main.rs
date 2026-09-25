@@ -81,9 +81,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show running Codex CLI, Codex desktop, and ChatGPT processes
+    /// Show running Codex CLI, Codex desktop, app-server, and ChatGPT processes
     Ps,
-    /// Gracefully close the listed Codex and ChatGPT processes
+    /// Gracefully close the listed Codex, app-server, and ChatGPT processes
     Stop {
         /// Close without prompting for confirmation
         #[arg(short, long)]

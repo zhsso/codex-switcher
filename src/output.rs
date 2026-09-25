@@ -176,7 +176,7 @@ impl Theme {
             self.paint(&format!("{} process(es)", rows.len()), "37")
         );
         if rows.is_empty() {
-            out.push_str("\n    No running Codex or ChatGPT processes found.\n\n");
+            out.push_str("\n    No running Codex, app-server, or ChatGPT processes found.\n\n");
             return out;
         }
 

@@ -13,6 +13,7 @@ use std::collections::HashSet;
 pub enum ProcessKind {
     CodexCli,
     CodexDesktop,
+    CodexAppServer,
     ChatGpt,
 }
 
@@ -21,6 +22,7 @@ impl ProcessKind {
         match self {
             Self::CodexCli => "Codex CLI",
             Self::CodexDesktop => "Codex desktop",
+            Self::CodexAppServer => "Codex app-server",
             Self::ChatGpt => "ChatGPT",
         }
     }
@@ -43,7 +45,7 @@ impl RunningProcess {
     }
 }
 
-/// Return active Codex CLI, Codex desktop, and ChatGPT desktop root processes.
+/// Return active Codex CLI, Codex desktop, app-server, and ChatGPT processes.
 pub fn list_running() -> Result<Vec<RunningProcess>> {
     #[cfg(unix)]
     {
@@ -183,8 +185,11 @@ fn classify_unix_process(process: UnixProcess) -> Option<RunningProcess> {
 
     #[cfg(target_os = "macos")]
     {
-        if lower_command.contains("app-server") {
-            return None;
+        if is_app_server_process(&process.name, &process.command) {
+            return Some(RunningProcess::new(
+                process.pid,
+                ProcessKind::CodexAppServer,
+            ));
         }
         let is_codex_cli = process.name == "codex"
             || process.name != "Codex" && executable_name(&process.command) == Some("codex");
@@ -203,8 +208,11 @@ fn classify_unix_process(process: UnixProcess) -> Option<RunningProcess> {
 
     #[cfg(not(target_os = "macos"))]
     {
-        if lower_command.contains("app-server") {
-            return None;
+        if is_app_server_process(&process.name, &process.command) {
+            return Some(RunningProcess::new(
+                process.pid,
+                ProcessKind::CodexAppServer,
+            ));
         }
         if process.name == "Codex" {
             return Some(RunningProcess::new(process.pid, ProcessKind::CodexDesktop));
@@ -219,6 +227,18 @@ fn classify_unix_process(process: UnixProcess) -> Option<RunningProcess> {
         }
         None
     }
+}
+
+#[cfg(unix)]
+fn is_app_server_process(name: &str, command: &str) -> bool {
+    let lower_name = name.to_ascii_lowercase();
+    let lower_command = command.to_ascii_lowercase();
+    lower_name == "codex-code-mode-host"
+        || lower_name == "codex-code-mode-host.exe"
+        || lower_command.contains("app-server-daemon")
+        || lower_command
+            .split_whitespace()
+            .any(|token| token.trim_matches('"') == "app-server")
 }
 
 #[cfg(unix)]
@@ -304,7 +324,11 @@ Get-Process -Name Codex,ChatGPT -ErrorAction SilentlyContinue | ForEach-Object {
 }
 $items = @(
   Get-CimInstance Win32_Process |
-    Where-Object { $_.Name -ieq 'Codex.exe' -or $_.Name -ieq 'ChatGPT.exe' } |
+Where-Object {
+  $_.Name -ieq 'Codex.exe' -or
+  $_.Name -ieq 'ChatGPT.exe' -or
+  $_.Name -ieq 'codex-code-mode-host.exe'
+} |
     ForEach-Object {
       [PSCustomObject]@{
         Name = $_.Name
@@ -358,10 +382,19 @@ fn classify_windows_processes(entries: &[WindowsProcess]) -> Vec<RunningProcess>
         if command.contains("--type=") || command.contains("codex-switcher") {
             continue;
         }
-        if name == "codex.exe" {
+        if name == "codex-code-mode-host.exe"
+            || command.contains("app-server-daemon")
+            || command
+                .split_whitespace()
+                .any(|token| token.trim_matches('"') == "app-server")
+        {
+            processes.push(RunningProcess::new(
+                process.process_id,
+                ProcessKind::CodexAppServer,
+            ));
+        } else if name == "codex.exe" {
             if command.contains("\\resources\\codex.exe")
                 || executable.contains("\\resources\\codex.exe")
-                || command.contains("app-server")
             {
                 continue;
             }
@@ -565,7 +598,7 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn classifies_cli_and_chatgpt_roots_but_skips_the_app_server() {
+    fn classifies_cli_chatgpt_and_app_server_processes() {
         let cli = classify_unix_process(UnixProcess {
             pid: 10,
             name: "codex".to_owned(),
@@ -585,8 +618,17 @@ mod tests {
         let app_server = classify_unix_process(UnixProcess {
             pid: 12,
             name: "codex".to_owned(),
-            command: "/app/resources/codex app-server".to_owned(),
+            command: "/home/user/.codex/packages/app-server-daemon/releases/0.1/bin/codex app-server --listen unix://".to_owned(),
         });
-        assert!(app_server.is_none());
+        assert_eq!(app_server.unwrap().kind, ProcessKind::CodexAppServer);
+
+        let code_mode_host = classify_unix_process(UnixProcess {
+            pid: 13,
+            name: "codex-code-mode-host".to_owned(),
+            command:
+                "/home/user/.codex/packages/app-server-daemon/releases/0.1/bin/codex-code-mode-host"
+                    .to_owned(),
+        });
+        assert_eq!(code_mode_host.unwrap().kind, ProcessKind::CodexAppServer);
     }
 }

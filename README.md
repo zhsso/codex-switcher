@@ -44,7 +44,7 @@ codex-switcher list
 codex-switcher list --json
 codex-switcher ls                  # list 的别名
 
-# 查看运行中的 Codex CLI、Codex 桌面端和 ChatGPT
+# 查看运行中的 Codex CLI、Codex 桌面端、app-server-daemon 和 ChatGPT
 codex-switcher ps
 
 # 先列出进程并确认后优雅关闭；-y/--yes 跳过确认
@@ -112,7 +112,7 @@ codex-switcher list --color never
 - 切换前核对当前身份，并保存 Codex 已轮换的 OAuth token；切换目标 token 即将过期或已过期时请求刷新；显式用量查询遇到 HTTP 401 时也会按需刷新。保存轮换后的 refresh token 后才报告无效 ID token 错误。
 - 账号命令使用文件锁避免同一账号库的并发写入；凭据文件采用原子替换，Unix 文件权限为 `0600`。
 - `list` 不发起网络请求、不输出 token 或 API key。账号文件本身仍包含明文凭据。
-- 切换通过写入文件生效；先退出正在使用该登录的 Codex 会话，切换后重新启动。`switch` 不会自动检测或关闭进程；可先用 `ps` 检查，必要时运行 `stop`。`stop` 只针对列出的根进程请求优雅关闭，不强制结束仍在运行的进程。
+- 切换通过写入文件生效；先退出正在使用该登录的 Codex 会话，切换后重新启动。`switch` 不会自动检测或关闭进程；可先用 `ps` 检查，必要时运行 `stop`。`stop` 只针对列出的进程请求优雅关闭，不强制结束仍在运行的进程。
 
 可以显式指定隔离目录，参数可放在子命令前后：
 
