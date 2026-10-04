@@ -48,6 +48,7 @@ codex-switcher ls                  # list 的别名
 codex-switcher ps
 
 # 先列出进程并确认后优雅关闭；-y/--yes 跳过确认
+# 托管 daemon 的自动更新进程（app-server updater）只列出、不关闭
 codex-switcher stop
 codex-switcher stop --yes
 

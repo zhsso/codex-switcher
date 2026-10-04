@@ -351,7 +351,10 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Stop { yes } => {
             let running = processes::list_running()?;
             print!("{}", theme.processes(&running));
-            if running.is_empty() {
+            if running.iter().any(|process| !process.kind.is_closable()) {
+                println!("The app-server updater is left running.");
+            }
+            if !running.iter().any(|process| process.kind.is_closable()) {
                 return Ok(());
             }
             if !yes {

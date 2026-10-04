@@ -14,6 +14,10 @@ pub enum ProcessKind {
     CodexCli,
     CodexDesktop,
     CodexAppServer,
+    /// The managed daemon's auto-updater; never stopped by `stop`.
+    CodexAppServerUpdater,
+    /// Helper spawned by an app-server or the CLI to run code-mode tools.
+    CodexCodeModeHost,
     ChatGpt,
 }
 
@@ -23,7 +27,41 @@ impl ProcessKind {
             Self::CodexCli => "Codex CLI",
             Self::CodexDesktop => "Codex desktop",
             Self::CodexAppServer => "Codex app-server",
+            Self::CodexAppServerUpdater => "Codex app-server updater",
+            Self::CodexCodeModeHost => "Codex code-mode host",
             Self::ChatGpt => "ChatGPT",
+        }
+    }
+
+    /// Whether `stop` closes this kind of process.
+    pub fn is_closable(&self) -> bool {
+        *self != Self::CodexAppServerUpdater
+    }
+
+    fn app_server(name: &str, command: &str) -> Self {
+        // Linux truncates process names to 15 bytes, so also check the executable.
+        let executable = command
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches('"')
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let name = name.to_ascii_lowercase();
+        if [name, executable]
+            .iter()
+            .any(|value| value == "codex-code-mode-host" || value == "codex-code-mode-host.exe")
+        {
+            Self::CodexCodeModeHost
+        } else if command
+            .split_whitespace()
+            .any(|token| token.trim_matches('"') == "pid-update-loop")
+        {
+            Self::CodexAppServerUpdater
+        } else {
+            Self::CodexAppServer
         }
     }
 }
@@ -62,16 +100,24 @@ pub fn list_running() -> Result<Vec<RunningProcess>> {
 }
 
 /// Gracefully close the reviewed process list. New processes are left alone and
-/// cause the operation to stop so the user can review them first.
+/// cause the operation to stop so the user can review them first. Processes
+/// that are not closable (the daemon updater) are always left running.
 pub fn stop(targets: &[RunningProcess]) -> Result<Vec<u32>> {
+    let targets: Vec<_> = targets
+        .iter()
+        .filter(|process| process.kind.is_closable())
+        .collect();
     if targets.is_empty() {
         return Ok(Vec::new());
     }
 
-    let current = list_running()?;
+    let current: Vec<_> = list_running()?
+        .into_iter()
+        .filter(|process| process.kind.is_closable())
+        .collect();
     let reviewed: std::collections::HashMap<_, _> = targets
         .iter()
-        .map(|process| (process.pid, process))
+        .map(|process| (process.pid, *process))
         .collect();
     let mut live = Vec::new();
 
@@ -250,7 +296,7 @@ fn classify_unix_process(process: UnixProcess) -> Option<RunningProcess> {
         if is_app_server_process(&process.name, &process.command) {
             return Some(RunningProcess::new(
                 process.pid,
-                ProcessKind::CodexAppServer,
+                ProcessKind::app_server(&process.name, &process.command),
             ));
         }
         let is_codex_cli = process.name == "codex"
@@ -273,7 +319,7 @@ fn classify_unix_process(process: UnixProcess) -> Option<RunningProcess> {
         if is_app_server_process(&process.name, &process.command) {
             return Some(RunningProcess::new(
                 process.pid,
-                ProcessKind::CodexAppServer,
+                ProcessKind::app_server(&process.name, &process.command),
             ));
         }
         if process.name == "Codex" {
@@ -297,6 +343,7 @@ fn is_app_server_process(name: &str, command: &str) -> bool {
     let lower_command = command.to_ascii_lowercase();
     lower_name == "codex-code-mode-host"
         || lower_name == "codex-code-mode-host.exe"
+        || executable_name(command) == Some("codex-code-mode-host")
         || lower_command.contains("app-server-daemon")
         || lower_command
             .split_whitespace()
@@ -452,7 +499,7 @@ fn classify_windows_processes(entries: &[WindowsProcess]) -> Vec<RunningProcess>
         {
             processes.push(RunningProcess::new(
                 process.process_id,
-                ProcessKind::CodexAppServer,
+                ProcessKind::app_server(&name, &command),
             ));
         } else if name == "codex.exe" {
             if command.contains("\\resources\\codex.exe")
@@ -701,11 +748,30 @@ mod tests {
 
         let code_mode_host = classify_unix_process(UnixProcess {
             pid: 13,
-            name: "codex-code-mode-host".to_owned(),
+            name: "codex-code-mode".to_owned(),
             command:
                 "/home/user/.codex/packages/app-server-daemon/releases/0.1/bin/codex-code-mode-host"
                     .to_owned(),
         });
-        assert_eq!(code_mode_host.unwrap().kind, ProcessKind::CodexAppServer);
+        assert_eq!(code_mode_host.unwrap().kind, ProcessKind::CodexCodeModeHost);
+
+        let cli_code_mode_host = classify_unix_process(UnixProcess {
+            pid: 15,
+            name: "codex-code-mode".to_owned(),
+            command: "/home/user/.npm/codex-linux-x64/bin/codex-code-mode-host".to_owned(),
+        });
+        assert_eq!(
+            cli_code_mode_host.unwrap().kind,
+            ProcessKind::CodexCodeModeHost
+        );
+
+        let updater = classify_unix_process(UnixProcess {
+            pid: 14,
+            name: "codex".to_owned(),
+            command: "/home/user/.codex/packages/app-server-daemon/releases/0.1/bin/codex app-server daemon pid-update-loop".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(updater.kind, ProcessKind::CodexAppServerUpdater);
+        assert!(!updater.kind.is_closable());
     }
 }
