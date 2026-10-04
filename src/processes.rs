@@ -114,6 +114,69 @@ pub fn stop(targets: &[RunningProcess]) -> Result<Vec<u32>> {
     Ok(live.iter().map(|process| process.pid).collect())
 }
 
+/// Terminate app-server server processes, leaving clients (`app-server proxy`),
+/// other subcommands, and code-mode helpers alone. Processes launched by the
+/// managed daemon (under `app-server-daemon/`) are only included on request.
+pub fn stop_app_servers(include_managed: bool) -> Result<Vec<u32>> {
+    #[cfg(unix)]
+    {
+        let output = Command::new("ps")
+            .args(["-eo", "pid=,tty=,ucomm=,command="])
+            .output()
+            .context("failed to query the local process list with ps")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "ps could not read the process list"
+        );
+        let targets: Vec<_> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(parse_unix_process_line)
+            .filter(|process| process.pid != std::process::id())
+            .filter(|process| {
+                is_app_server_daemon_process(&process.command)
+                    && (include_managed || !process.command.contains("app-server-daemon"))
+            })
+            .map(|process| RunningProcess::new(process.pid, ProcessKind::CodexAppServer))
+            .collect();
+        for process in &targets {
+            request_close(process);
+        }
+        wait_for_exit(&targets, Duration::from_secs(8));
+        let remaining: Vec<_> = targets
+            .iter()
+            .filter(|process| process_exists(process.pid))
+            .map(|process| process.pid.to_string())
+            .collect();
+        anyhow::ensure!(
+            remaining.is_empty(),
+            "app-server process(es) {} still running after a shutdown request",
+            remaining.join(", ")
+        );
+        Ok(targets.iter().map(|process| process.pid).collect())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = include_managed;
+        anyhow::bail!("Stopping app-server processes is only supported on Unix")
+    }
+}
+
+/// `... app-server [--flags]` is a server; `app-server <subcommand>` is not.
+#[cfg(unix)]
+fn is_app_server_daemon_process(command: &str) -> bool {
+    if command.contains("codex-switcher") {
+        return false;
+    }
+    let mut tokens = command
+        .split_whitespace()
+        .map(|token| token.trim_matches('"'));
+    if !tokens.any(|token| token == "app-server") {
+        return false;
+    }
+    tokens.next().is_none_or(|next| next.starts_with('-'))
+}
+
 #[cfg(unix)]
 #[derive(Debug, Eq, PartialEq)]
 struct UnixProcess {
@@ -597,6 +660,21 @@ mod tests {
     }
 
     #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn recognizes_only_app_server_servers() {
+        use super::is_app_server_daemon_process as server;
+        assert!(server("/usr/lib/chatgpt/resources/codex -c features.x=true app-server --analytics-default-enabled -c a=b"));
+        assert!(server("/home/u/.codex/packages/app-server-daemon/releases/0.1/bin/codex app-server --listen unix://"));
+        assert!(server("codex app-server"));
+        assert!(!server("codex app-server proxy"));
+        assert!(!server("codex app-server daemon restart"));
+        assert!(!server(
+            "/home/u/.npm/codex-linux-x64/bin/codex-code-mode-host"
+        ));
+        assert!(!server("codex --yolo resume --last"));
+        assert!(!server("codex-switcher daemon run app-server"));
+    }
+
     #[test]
     fn classifies_cli_chatgpt_and_app_server_processes() {
         let cli = classify_unix_process(UnixProcess {

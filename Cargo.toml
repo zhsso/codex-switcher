@@ -20,6 +20,7 @@ sha2 = "0.10"
 tempfile = "3"
 tiny_http = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+toml_edit = "0.25.15"
 url = "2"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4", "serde"] }

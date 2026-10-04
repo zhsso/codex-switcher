@@ -3,7 +3,7 @@ use std::fmt::Write;
 
 use chrono::Local;
 
-use crate::{processes::RunningProcess, status::AccountStatus, usage::AccountUsage};
+use crate::{daemon::State, processes::RunningProcess, status::AccountStatus, usage::AccountUsage};
 
 pub struct Theme {
     pub color: bool,
@@ -193,6 +193,60 @@ impl Theme {
                 self.paint(&label, "1;97"),
                 self.paint(&process.pid.to_string(), "93")
             );
+        }
+        out.push('\n');
+        out
+    }
+
+    pub fn daemon(&self, state: Option<&State>) -> String {
+        let mut out = format!("\n  {}\n", self.paint("Auto-switch daemon", "1;96"));
+        let Some(state) = state else {
+            out.push_str(
+                "\n    No checks recorded yet. Start it with `daemon install` or `daemon run`.\n\n",
+            );
+            return out;
+        };
+        let time = |value: Option<chrono::DateTime<chrono::Utc>>| {
+            value.map_or("-".into(), |value| {
+                value
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            })
+        };
+        let mut row = |label: &str, value: String| {
+            let _ = writeln!(
+                out,
+                "    {}  {value}",
+                self.paint(&format!("{label:<12}"), "37")
+            );
+        };
+        row("PID", state.pid.to_string());
+        row("Active", state.active.as_deref().map_or("-".into(), clean));
+        row(
+            "5h left",
+            state
+                .remaining_5h
+                .map_or("-".into(), |value| format!("{value:.1}%")),
+        );
+        row("Last check", time(state.checked_at));
+        row("Next check", time(state.next_check_at));
+        if state.paused_until.is_some() {
+            row("Paused until", self.paint(&time(state.paused_until), "93"));
+        }
+        if let Some(switch) = &state.last_switch {
+            row(
+                "Last switch",
+                format!(
+                    "{} -> {} at {}",
+                    clean(&switch.from),
+                    clean(&switch.to),
+                    time(Some(switch.at))
+                ),
+            );
+        }
+        if let Some(error) = &state.last_error {
+            row("Last error", self.paint(&clean(error), "91"));
         }
         out.push('\n');
         out

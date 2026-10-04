@@ -429,3 +429,158 @@ fn status_uses_official_codex_api_route_and_auth_headers_for_custom_backend() {
     assert_eq!(rows[0]["windows"][0]["used_percent"], 12.0);
     assert_eq!(rows[0]["windows"][0]["resets_in_seconds"], 600);
 }
+
+#[test]
+fn daemon_switches_to_account_with_most_quota_and_enables_auto_start() {
+    let fixture = Fixture::new();
+    for (name, suffix) in [("low", "low"), ("mid", "mid"), ("high", "high")] {
+        fixture.write_auth(&oauth_auth(&format!("workspace-{name}"), suffix));
+        fixture.ok(&["add", name]);
+    }
+    fixture.ok(&["switch", "low"]);
+    fs::write(
+        fixture.storage().codex_home.join("config.toml"),
+        "# mine\n[features]\ndaemon_auto_start = false\n",
+    )
+    .unwrap();
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", server.server_addr());
+    std::thread::spawn(move || {
+        while let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_secs(10)) {
+            let token = request
+                .headers()
+                .iter()
+                .find(|header| header.field.equiv("authorization"))
+                .map(|header| header.value.as_str().to_owned())
+                .unwrap_or_default();
+            let used = match token.as_str() {
+                "Bearer access-low" => 99.5,
+                "Bearer access-mid" => 50.0,
+                _ => 10.0,
+            };
+            let body = json!({"rate_limit": {
+                "primary_window": {"used_percent": used, "limit_window_seconds": 18000, "reset_after_seconds": 600},
+                "secondary_window": {"used_percent": 5, "limit_window_seconds": 604800, "reset_after_seconds": 6000}
+            }});
+            let _ = request.respond(tiny_http::Response::from_string(body.to_string()));
+        }
+    });
+    let mut child = fixture
+        .command(&[
+            "daemon",
+            "run",
+            "--base-url",
+            &base_url,
+            "--codex-bin",
+            "true",
+            "--no-restart",
+            "--min-interval",
+            "1",
+            "--max-interval",
+            "1",
+        ])
+        .env("NO_PROXY", "127.0.0.1")
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let state = loop {
+        let path = fixture.storage().directory.join("daemon-state.json");
+        if let Ok(contents) = fs::read(&path) {
+            let state: Value = serde_json::from_slice(&contents).unwrap();
+            if !state["last_switch"].is_null() {
+                break state;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never switched"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(state["last_switch"]["from"], "low");
+    assert_eq!(state["last_switch"]["to"], "high");
+    assert_eq!(fixture.auth()["tokens"]["access_token"], "access-high");
+    assert_eq!(
+        fs::read_to_string(fixture.storage().codex_home.join("config.toml")).unwrap(),
+        "# mine\n[features]\ndaemon_auto_start = true\n"
+    );
+    assert!(fixture.ok(&["daemon", "status"]).contains("low -> high"));
+}
+
+#[test]
+fn daemon_pauses_when_all_accounts_are_exhausted_until_a_manual_switch() {
+    let fixture = Fixture::new();
+    for name in ["a", "b"] {
+        fixture.write_auth(&oauth_auth(&format!("workspace-{name}"), name));
+        fixture.ok(&["add", name]);
+    }
+    fixture.ok(&["switch", "a"]);
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", server.server_addr());
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = requests.clone();
+    std::thread::spawn(move || {
+        while let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_secs(10)) {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = json!({"rate_limit": {
+                "primary_window": {"used_percent": 99.9, "limit_window_seconds": 18000, "reset_after_seconds": 3600}
+            }});
+            let _ = request.respond(tiny_http::Response::from_string(body.to_string()));
+        }
+    });
+    let mut child = fixture
+        .command(&[
+            "daemon",
+            "run",
+            "--base-url",
+            &base_url,
+            "--no-restart",
+            "--min-interval",
+            "1",
+            "--max-interval",
+            "1",
+        ])
+        .env("NO_PROXY", "127.0.0.1")
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let state_path = fixture.storage().directory.join("daemon-state.json");
+    let wait_for = |predicate: &dyn Fn(&Value) -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if let Ok(contents) = fs::read(&state_path) {
+                if let Ok(state) = serde_json::from_slice::<Value>(&contents) {
+                    if predicate(&state) {
+                        return state;
+                    }
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    let ids: Vec<String> = fixture
+        .list()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_owned())
+        .collect();
+    let paused = wait_for(&|state| !state["paused_until"].is_null());
+    assert_eq!(paused["paused_active_id"], ids[0].as_str());
+    assert!(paused["last_switch"].is_null());
+    // Paused: no further usage requests for the full max interval.
+    let before = requests.load(std::sync::atomic::Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), before);
+    assert!(fixture.ok(&["daemon", "status"]).contains("Paused until"));
+    // A manual switch resumes checking, which pauses again on the new account.
+    fixture.ok(&["switch", "b"]);
+    wait_for(&|state| state["paused_active_id"] == ids[1].as_str());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(fixture.auth()["tokens"]["access_token"], "access-b");
+}

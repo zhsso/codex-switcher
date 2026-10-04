@@ -1,8 +1,8 @@
 # Codex Switcher CLI
 
-一个独立的 Rust 命令行账号管理工具，提供 `add`、`remove`、`edit`、`switch`，以及用于查看账号列表与实时用量的 `list`、`status`。
+一个独立的 Rust 命令行账号管理工具，提供 `add`、`remove`、`edit`、`switch`，用于查看账号列表与实时用量的 `list`、`status`，以及额度耗尽时自动切换账号的 `daemon`。
 
-已移除 Tauri/React GUI、Web UI、托盘、后台进程监控、自动预热和自动更新。无需 Node.js、pnpm 或桌面环境，不运行后台服务；查看和关闭进程由 `ps`、`stop` 命令显式执行。
+已移除 Tauri/React GUI、Web UI、托盘、后台进程监控、自动预热和自动更新。无需 Node.js、pnpm 或桌面环境；默认不运行后台服务，自动切换需显式启用 `daemon`。查看和关闭进程由 `ps`、`stop` 命令显式执行。
 
 ## 安装
 
@@ -130,3 +130,32 @@ cargo clippy --all-targets --locked -- -D warnings
 ```
 
 测试使用临时目录、虚构凭据和本地模拟 HTTP 服务，不修改实际账号或请求真实 OAuth token。
+
+## 自动切换（daemon）
+
+```sh
+codex-switcher daemon install        # Linux：安装并启动 systemd 用户服务
+codex-switcher daemon status         # 上次检查、下次检查、最近一次切换
+codex-switcher daemon status --json
+codex-switcher daemon stop           # 停止服务（start / restart 同理）
+codex-switcher daemon uninstall      # 停止并删除服务
+codex-switcher daemon run            # 前台运行，Ctrl+C 退出
+journalctl --user -u codex-switcher.service -f   # 查看日志
+```
+
+启动时会把 `$CODEX_HOME/config.toml` 中的 `[features] daemon_auto_start` 自动设为 `true`（保留原有注释与格式），关闭客户端自行拉起的 app-server（如桌面端的 `/usr/lib/chatgpt/resources/codex ... app-server`），再运行 `codex app-server daemon start`，使客户端统一连接托管 daemon。`app-server proxy` 等子命令和 Codex CLI 自身的进程不受影响。
+
+守护进程定期查询当前账号用量，按 5h 剩余百分比调整频率：高于 50% 时为 `--max-interval`，20–50% 为其 1/2，5–20% 为其 1/5，更低时为 `--min-interval`。任一窗口（5h 或每周）剩余低于 `--threshold` 时，查询全部账号，在所有窗口均高于阈值的账号中选择 5h 剩余最多的一个，执行与 `switch` 相同的切换；随后关闭客户端自行拉起的 app-server 并运行 `codex app-server daemon restart`（失败时改为关闭托管 app-server 进程，由自动启动拉起）。重启会直接中断进行中的任务。
+
+所有账号都不可用时暂停：不再查询也不切换，直到最早有账号额度重置（`daemon status` 显示 `Paused until`），届时重新查询并选择账号。暂停期间手动 `switch` 到其他账号或 `daemon restart` 会立即恢复检查。
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--threshold` | `1` | 剩余百分比低于此值时切换 |
+| `--min-interval` | `30` | 最短检查间隔（秒） |
+| `--max-interval` | `600` | 最长检查间隔（秒） |
+| `--cooldown` | `300` | 两次自动切换的最小间隔（秒） |
+| `--codex-bin` | `codex` | 用于重启 app-server 的 Codex 可执行文件 |
+| `--no-restart` | 关 | 只切换账号，不关闭、启动或重启任何 app-server |
+
+`daemon install` 接受相同参数，并把它们与当前的 `--store-dir`、`--codex-home` 写入服务。查询失败时按指数退避重试。API key 账号不受监控，也不会被选为切换目标。
