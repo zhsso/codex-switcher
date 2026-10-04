@@ -5,7 +5,8 @@ use std::sync::atomic::Ordering;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use codex_switcher::{
-    accounts, auth, daemon, processes, status, storage::Storage, types::StoredAccount, usage,
+    accounts, app_server, auth, daemon, processes, status, storage::Storage, types::StoredAccount,
+    usage,
 };
 
 #[derive(Parser)]
@@ -24,6 +25,12 @@ struct Cli {
     /// Codex directory (default: CODEX_HOME or ~/.codex)
     #[arg(long, global = true)]
     codex_home: Option<PathBuf>,
+    /// Codex executable used to control the app-server daemon
+    #[arg(long, global = true, default_value = "codex")]
+    codex_bin: String,
+    /// Never stop, start, or restart app-server processes (switch, edit, daemon)
+    #[arg(long, global = true)]
+    no_restart: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -131,19 +138,13 @@ struct DaemonArgs {
     /// Minimum seconds between automatic switches
     #[arg(long, default_value_t = 300)]
     cooldown: u64,
-    /// Codex executable used for `codex app-server daemon restart`
-    #[arg(long, default_value = "codex")]
-    codex_bin: String,
     /// Backend base URL receiving the account token (Codex path selection)
     #[arg(long, default_value = usage::DEFAULT_BASE_URL)]
     base_url: String,
-    /// Only switch accounts; never stop, start, or restart app-server processes
-    #[arg(long)]
-    no_restart: bool,
 }
 
 impl DaemonArgs {
-    fn settings(&self) -> Result<daemon::Settings> {
+    fn settings(&self, codex_bin: &str, no_restart: bool) -> Result<daemon::Settings> {
         anyhow::ensure!(
             self.threshold.is_finite() && (0.0..100.0).contains(&self.threshold),
             "--threshold must be between 0 and 100"
@@ -158,14 +159,14 @@ impl DaemonArgs {
             max_interval: std::time::Duration::from_secs(self.max_interval),
             cooldown: std::time::Duration::from_secs(self.cooldown),
             base_url: self.base_url.clone(),
-            codex_bin: self.codex_bin.clone(),
-            manage_app_server: !self.no_restart,
+            codex_bin: codex_bin.to_owned(),
+            manage_app_server: !no_restart,
         })
     }
 
     #[cfg(target_os = "linux")]
     fn to_args(&self) -> Vec<String> {
-        let mut args = vec![
+        vec![
             "--threshold".into(),
             self.threshold.to_string(),
             "--min-interval".into(),
@@ -174,15 +175,9 @@ impl DaemonArgs {
             self.max_interval.to_string(),
             "--cooldown".into(),
             self.cooldown.to_string(),
-            "--codex-bin".into(),
-            self.codex_bin.clone(),
             "--base-url".into(),
             self.base_url.clone(),
-        ];
-        if self.no_restart {
-            args.push("--no-restart".into());
-        }
-        args
+        ]
     }
 }
 
@@ -194,6 +189,24 @@ struct Source {
     /// Read an API key from standard input (never from command-line arguments)
     #[arg(long)]
     api_key_stdin: bool,
+}
+
+/// Make running Codex clients pick up the account now in auth.json.
+fn restart_app_servers(storage: &Storage, codex_bin: &str) -> Result<()> {
+    let refresh = app_server::refresh(codex_bin, &storage.codex_home, "restart").context(
+        "Restarting the app-server failed; running Codex sessions keep the previous account until it restarts",
+    )?;
+    if refresh.config_changed {
+        println!("Set [features] daemon_auto_start = true");
+    }
+    if !refresh.stopped.is_empty() {
+        println!(
+            "Stopped {} standalone app-server process(es)",
+            refresh.stopped.len()
+        );
+    }
+    println!("Restarted app-server");
+    Ok(())
 }
 
 fn import(storage: &Storage, source: &Source, name: String) -> Result<StoredAccount> {
@@ -296,17 +309,21 @@ async fn run(cli: Cli) -> Result<()> {
                 None
             };
             let name = name.map(|name| name.trim().to_owned());
-            println!(
-                "Updated {}",
-                accounts::edit(&storage, &account, name, replacement)?
-            );
+            let (name, live) = accounts::edit(&storage, &account, name, replacement)?;
+            println!("Updated {name}");
+            if live && !cli.no_restart {
+                restart_app_servers(&storage, &cli.codex_bin)?;
+            }
         }
         Command::Switch { account } => {
             let selector = account.join(" ");
             println!(
                 "Switched to {}",
                 accounts::switch(&storage, &selector).await?
-            )
+            );
+            if !cli.no_restart {
+                restart_app_servers(&storage, &cli.codex_bin)?;
+            }
         }
         Command::Status {
             account,
@@ -372,14 +389,29 @@ async fn run(cli: Cli) -> Result<()> {
                     return Ok(());
                 }
             }
-            let stopped = processes::stop(&running)?;
-            println!("Closed {} process(es).", stopped.len());
+            let mut closed = 0;
+            if running
+                .iter()
+                .any(|process| process.managed && process.kind.is_closable())
+            {
+                // Killing the managed daemon directly leaves clients unable to reconnect.
+                app_server::daemon_command(&cli.codex_bin, &storage.codex_home, "stop")?;
+                println!("Stopped the managed app-server daemon.");
+                closed += running
+                    .iter()
+                    .filter(|process| process.managed && process.kind.is_closable())
+                    .count();
+            }
+            closed += processes::stop(&running)?.len();
+            println!("Closed {closed} process(es).");
         }
         Command::Daemon { action } => match action {
-            DaemonAction::Run(args) => daemon::run(&storage, args.settings()?).await?,
+            DaemonAction::Run(args) => {
+                daemon::run(&storage, args.settings(&cli.codex_bin, cli.no_restart)?).await?
+            }
             #[cfg(target_os = "linux")]
             DaemonAction::Install(args) => {
-                args.settings()?;
+                args.settings(&cli.codex_bin, cli.no_restart)?;
                 let exe = std::env::current_exe()?;
                 let mut command = vec![exe.to_string_lossy().into_owned()];
                 let (store_dir, codex_home) = explicit_dirs;
@@ -396,18 +428,25 @@ async fn run(cli: Cli) -> Result<()> {
                     "daemon".into(),
                     "run".into(),
                 ]);
-                let mut args = args;
-                // Service managers run with a minimal PATH; pin the executable.
-                if let Some(codex) = daemon::resolve_codex_bin(&args.codex_bin, &storage.codex_home)
-                {
-                    args.codex_bin = std::path::absolute(codex)?.to_string_lossy().into_owned();
-                } else {
-                    eprintln!(
-                        "warning: `{}` not found; app-server restarts will fail until --codex-bin is set",
-                        args.codex_bin
-                    );
-                }
                 command.extend(args.to_args());
+                // Service managers run with a minimal PATH; pin the executable.
+                let codex_bin = match app_server::resolve_codex_bin(
+                    &cli.codex_bin,
+                    &storage.codex_home,
+                ) {
+                    Some(codex) => std::path::absolute(codex)?.to_string_lossy().into_owned(),
+                    None => {
+                        eprintln!(
+                            "warning: `{}` not found; app-server restarts will fail until --codex-bin is set",
+                            cli.codex_bin
+                        );
+                        cli.codex_bin.clone()
+                    }
+                };
+                command.extend(["--codex-bin".into(), codex_bin]);
+                if cli.no_restart {
+                    command.push("--no-restart".into());
+                }
                 if codex_switcher::config::ensure_daemon_auto_start(&storage.codex_home)? {
                     println!("Set [features] daemon_auto_start = true");
                 }

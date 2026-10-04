@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    accounts, config, processes,
+    accounts, app_server, config,
     storage::Storage,
     usage::{self, AccountUsage},
 };
@@ -151,57 +151,23 @@ fn log(message: impl std::fmt::Display) {
     );
 }
 
-/// Resolve the Codex executable: a path is used as given, a bare name is
-/// looked up on PATH, then in the managed daemon's install (service managers
-/// often run with a PATH that lacks npm or user bin directories).
-pub fn resolve_codex_bin(codex_bin: &str, codex_home: &Path) -> Option<PathBuf> {
-    if codex_bin.contains('/') {
-        return Some(PathBuf::from(codex_bin));
-    }
-    std::env::var_os("PATH")
-        .iter()
-        .flat_map(std::env::split_paths)
-        .map(|dir| dir.join(codex_bin))
-        .chain(
-            (codex_bin == "codex")
-                .then(|| codex_home.join("packages/app-server-daemon/current/bin/codex")),
-        )
-        .find(|path| path.is_file())
-}
-
-fn codex_daemon(settings: &Settings, codex_home: &Path, action: &str) -> Result<()> {
-    let codex = resolve_codex_bin(&settings.codex_bin, codex_home).with_context(|| {
-        format!(
-            "Could not find `{}` on PATH; pass --codex-bin with an absolute path",
-            settings.codex_bin
-        )
-    })?;
-    let output = Command::new(&codex)
-        .args(["app-server", "daemon", action])
-        .output()
-        .with_context(|| format!("Could not run {}", codex.display()))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "`{} app-server daemon {action}` failed: {}",
-        codex.display(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(())
-}
-
-/// Stop app-servers that clients spawned themselves (e.g. the desktop app) so
-/// they reconnect through the managed daemon, then start or restart it. The
-/// managed daemon itself is only ever restarted through Codex: killing it
-/// directly leaves clients unable to reconnect.
 fn refresh_app_servers(settings: &Settings, codex_home: &Path, action: &str) -> Result<()> {
-    let stopped = processes::stop_standalone_app_servers()?;
-    if !stopped.is_empty() {
+    let refresh = app_server::refresh(&settings.codex_bin, codex_home, action)?;
+    if refresh.config_changed {
+        log("Set [features] daemon_auto_start = true in config.toml");
+    }
+    if !refresh.stopped.is_empty() {
         log(format!(
             "Stopped {} standalone app-server process(es)",
-            stopped.len()
+            refresh.stopped.len()
         ));
     }
-    codex_daemon(settings, codex_home, action)
+    log(if action == "start" {
+        "Started app-server daemon"
+    } else {
+        "Restarted app-server"
+    });
+    Ok(())
 }
 
 /// One check. Returns how long to sleep before the next one.
@@ -283,19 +249,17 @@ async fn tick(storage: &Storage, settings: &Settings, state: &mut State) -> Resu
     state.remaining_5h = window(next, "5h");
     if settings.manage_app_server {
         refresh_app_servers(settings, &storage.codex_home, "restart")?;
-        log("Restarted app-server");
     }
     Ok(next_interval(state.remaining_5h, settings))
 }
 
 pub async fn run(storage: &Storage, settings: Settings) -> Result<()> {
-    if config::ensure_daemon_auto_start(&storage.codex_home)? {
-        log("Set [features] daemon_auto_start = true in config.toml");
-    }
     if settings.manage_app_server {
         if let Err(error) = refresh_app_servers(&settings, &storage.codex_home, "start") {
             log(format!("App-server cleanup failed: {error:#}"));
         }
+    } else if config::ensure_daemon_auto_start(&storage.codex_home)? {
+        log("Set [features] daemon_auto_start = true in config.toml");
     }
     let mut state = read_state(storage)?.unwrap_or_default();
     state.pid = std::process::id();
@@ -537,22 +501,6 @@ mod tests {
         assert!(pick_next(&rows[..4], Some("active"), 1.0).is_none());
         assert_eq!(earliest_reset(&rows[..4], 1.0), Some(100));
         assert_eq!(earliest_reset(&rows[1..4], 1.0), Some(5000));
-    }
-
-    #[test]
-    fn falls_back_to_the_managed_daemon_binary() {
-        let home = tempfile::tempdir().unwrap();
-        let missing = "codex-switcher-test-missing-binary";
-        assert!(resolve_codex_bin(missing, home.path()).is_none());
-        assert_eq!(
-            resolve_codex_bin("/opt/x/codex", home.path()),
-            Some(PathBuf::from("/opt/x/codex"))
-        );
-        let managed = home.path().join("packages/app-server-daemon/current/bin");
-        std::fs::create_dir_all(&managed).unwrap();
-        std::fs::write(managed.join("codex"), "").unwrap();
-        let resolved = resolve_codex_bin("codex", home.path()).unwrap();
-        assert!(resolved.is_file());
     }
 
     #[cfg(target_os = "linux")]

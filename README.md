@@ -48,6 +48,7 @@ codex-switcher ls                  # list 的别名
 codex-switcher ps
 
 # 先列出进程并确认后优雅关闭；-y/--yes 跳过确认
+# 托管 app-server 通过 `codex app-server daemon stop` 关闭（直接终止会导致客户端无法重连）；
 # 托管 daemon 的自动更新进程（app-server updater）只列出、不关闭
 codex-switcher stop
 codex-switcher stop --yes
@@ -55,6 +56,7 @@ codex-switcher stop --yes
 # 按精确名称或完整 ID 切换
 codex-switcher switch work
 codex-switcher switch So Zhang       # 名称含空格时无需加引号
+codex-switcher switch work --no-restart   # 只切换，不重启 app-server
 
 # 修改名称、替换凭据，或同时修改
 codex-switcher edit work --name company
@@ -65,7 +67,9 @@ codex-switcher edit api --api-key-stdin < /path/to/new-api-key.txt
 codex-switcher remove personal
 ```
 
-`add` 不自动切换；需要激活新账号时显式运行 `switch`。`edit` 保留账号 ID、创建时间和使用记录；替换当前账号的凭据时也会更新当前 `auth.json`。重名、空名称、未知账号、无效认证文件和参数冲突会返回非零退出码。
+`add` 不自动切换；需要激活新账号时显式运行 `switch`。`edit` 保留账号 ID、创建时间和使用记录；替换当前账号的凭据时也会更新当前 `auth.json`。
+
+运行中的 app-server 不会重新加载属于其他账号的 `auth.json`，因此 `switch` 以及替换当前账号凭据的 `edit` 完成后会重启 app-server：确保 `[features] daemon_auto_start = true`，关闭客户端自行拉起的 app-server，再运行 `codex app-server daemon restart`，已连接的 CLI 会自动重连，进行中的任务会被中断。全局参数 `--no-restart` 跳过这一步，`--codex-bin` 指定 Codex 可执行文件（默认 `codex`，PATH 中找不到时使用 `$CODEX_HOME/packages/app-server-daemon/current/bin/codex`）。重名、空名称、未知账号、无效认证文件和参数冲突会返回非零退出码。
 
 OAuth 登录仅在命令执行期间启动本地回调监听器，默认端口为 `1455`，占用时选择空闲端口；等待最多五分钟，可用 Ctrl+C 取消。远程主机上的登录需要浏览器能够访问该主机的回调端口。
 
@@ -156,7 +160,7 @@ journalctl --user -u codex-switcher.service -f   # 查看日志
 | `--min-interval` | `30` | 最短检查间隔（秒） |
 | `--max-interval` | `600` | 最长检查间隔（秒） |
 | `--cooldown` | `300` | 两次自动切换的最小间隔（秒） |
-| `--codex-bin` | `codex` | 用于重启 app-server 的 Codex 可执行文件；PATH 中找不到时使用 `$CODEX_HOME/packages/app-server-daemon/current/bin/codex`。`daemon install` 会写入其绝对路径和当前 PATH |
-| `--no-restart` | 关 | 只切换账号，不关闭、启动或重启任何 app-server |
+| `--codex-bin` | `codex` | 全局参数，见上文；`daemon install` 会写入其绝对路径和当前 PATH |
+| `--no-restart` | 关 | 全局参数，只切换账号，不关闭、启动或重启任何 app-server |
 
 `daemon install` 接受相同参数，并把它们与当前的 `--store-dir`、`--codex-home` 写入服务。查询失败时按指数退避重试。API key 账号不受监控，也不会被选为切换目标。

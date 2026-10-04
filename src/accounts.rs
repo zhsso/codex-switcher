@@ -130,12 +130,13 @@ pub fn remove(storage: &Storage, selector: &str) -> Result<String> {
 }
 
 /// Credential edits retain the profile ID, creation time and display name.
+/// Returns the name and whether the live auth.json was rewritten.
 pub fn edit(
     storage: &Storage,
     selector: &str,
     name: Option<String>,
     replacement: Option<StoredAccount>,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let _lock = storage.lock()?;
     let mut store = load_current(storage)?;
     let index = resolve(&store, selector)?;
@@ -157,7 +158,7 @@ pub fn edit(
             .write_auth(&updated)
             .context("Profile saved, but updating the active auth.json failed; run switch again")?;
     }
-    Ok(name)
+    Ok((name, update_live))
 }
 
 pub async fn switch(storage: &Storage, selector: &str) -> Result<String> {

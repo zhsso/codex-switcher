@@ -70,6 +70,8 @@ impl ProcessKind {
 pub struct RunningProcess {
     pub pid: u32,
     pub kind: ProcessKind,
+    /// Belongs to the managed app-server daemon (under `app-server-daemon/`).
+    pub managed: bool,
     bundle_id: Option<String>,
 }
 
@@ -78,7 +80,15 @@ impl RunningProcess {
         Self {
             pid,
             kind,
+            managed: false,
             bundle_id: None,
+        }
+    }
+
+    fn app_server(pid: u32, name: &str, command: &str) -> Self {
+        Self {
+            managed: command.to_ascii_lowercase().contains("app-server-daemon"),
+            ..Self::new(pid, ProcessKind::app_server(name, command))
         }
     }
 }
@@ -100,21 +110,19 @@ pub fn list_running() -> Result<Vec<RunningProcess>> {
 }
 
 /// Gracefully close the reviewed process list. New processes are left alone and
-/// cause the operation to stop so the user can review them first. Processes
-/// that are not closable (the daemon updater) are always left running.
+/// cause the operation to stop so the user can review them first. Managed
+/// daemon processes are skipped: stop those with `codex app-server daemon stop`.
 pub fn stop(targets: &[RunningProcess]) -> Result<Vec<u32>> {
+    let signalled = |process: &RunningProcess| process.kind.is_closable() && !process.managed;
     let targets: Vec<_> = targets
         .iter()
-        .filter(|process| process.kind.is_closable())
+        .filter(|process| signalled(process))
         .collect();
     if targets.is_empty() {
         return Ok(Vec::new());
     }
 
-    let current: Vec<_> = list_running()?
-        .into_iter()
-        .filter(|process| process.kind.is_closable())
-        .collect();
+    let current: Vec<_> = list_running()?.into_iter().filter(signalled).collect();
     let reviewed: std::collections::HashMap<_, _> = targets
         .iter()
         .map(|process| (process.pid, *process))
@@ -294,9 +302,10 @@ fn classify_unix_process(process: UnixProcess) -> Option<RunningProcess> {
     #[cfg(target_os = "macos")]
     {
         if is_app_server_process(&process.name, &process.command) {
-            return Some(RunningProcess::new(
+            return Some(RunningProcess::app_server(
                 process.pid,
-                ProcessKind::app_server(&process.name, &process.command),
+                &process.name,
+                &process.command,
             ));
         }
         let is_codex_cli = process.name == "codex"
@@ -308,6 +317,7 @@ fn classify_unix_process(process: UnixProcess) -> Option<RunningProcess> {
             return Some(RunningProcess {
                 pid: process.pid,
                 kind,
+                managed: false,
                 bundle_id: Some(bundle_id),
             });
         }
@@ -317,9 +327,10 @@ fn classify_unix_process(process: UnixProcess) -> Option<RunningProcess> {
     #[cfg(not(target_os = "macos"))]
     {
         if is_app_server_process(&process.name, &process.command) {
-            return Some(RunningProcess::new(
+            return Some(RunningProcess::app_server(
                 process.pid,
-                ProcessKind::app_server(&process.name, &process.command),
+                &process.name,
+                &process.command,
             ));
         }
         if process.name == "Codex" {
@@ -497,9 +508,10 @@ fn classify_windows_processes(entries: &[WindowsProcess]) -> Vec<RunningProcess>
                 .split_whitespace()
                 .any(|token| token.trim_matches('"') == "app-server")
         {
-            processes.push(RunningProcess::new(
+            processes.push(RunningProcess::app_server(
                 process.process_id,
-                ProcessKind::app_server(&name, &command),
+                &name,
+                &command,
             ));
         } else if name == "codex.exe" {
             if command.contains("\\resources\\codex.exe")
@@ -744,7 +756,9 @@ mod tests {
             name: "codex".to_owned(),
             command: "/home/user/.codex/packages/app-server-daemon/releases/0.1/bin/codex app-server --listen unix://".to_owned(),
         });
-        assert_eq!(app_server.unwrap().kind, ProcessKind::CodexAppServer);
+        let app_server = app_server.unwrap();
+        assert_eq!(app_server.kind, ProcessKind::CodexAppServer);
+        assert!(app_server.managed);
 
         let code_mode_host = classify_unix_process(UnixProcess {
             pid: 13,
@@ -760,10 +774,9 @@ mod tests {
             name: "codex-code-mode".to_owned(),
             command: "/home/user/.npm/codex-linux-x64/bin/codex-code-mode-host".to_owned(),
         });
-        assert_eq!(
-            cli_code_mode_host.unwrap().kind,
-            ProcessKind::CodexCodeModeHost
-        );
+        let cli_code_mode_host = cli_code_mode_host.unwrap();
+        assert_eq!(cli_code_mode_host.kind, ProcessKind::CodexCodeModeHost);
+        assert!(!cli_code_mode_host.managed);
 
         let updater = classify_unix_process(UnixProcess {
             pid: 14,

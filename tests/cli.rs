@@ -24,7 +24,9 @@ impl Fixture {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_codex-switcher"));
+        // Never touch real app-server processes from tests.
         command
+            .arg("--no-restart")
             .arg("--store-dir")
             .arg(self.storage().directory)
             .arg("--codex-home")
@@ -473,7 +475,6 @@ fn daemon_switches_to_account_with_most_quota_and_enables_auto_start() {
             &base_url,
             "--codex-bin",
             "true",
-            "--no-restart",
             "--min-interval",
             "1",
             "--max-interval",
@@ -537,7 +538,6 @@ fn daemon_pauses_when_all_accounts_are_exhausted_until_a_manual_switch() {
             "run",
             "--base-url",
             &base_url,
-            "--no-restart",
             "--min-interval",
             "1",
             "--max-interval",
