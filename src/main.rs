@@ -393,6 +393,17 @@ async fn run(cli: Cli) -> Result<()> {
                     "daemon".into(),
                     "run".into(),
                 ]);
+                let mut args = args;
+                // Service managers run with a minimal PATH; pin the executable.
+                if let Some(codex) = daemon::resolve_codex_bin(&args.codex_bin, &storage.codex_home)
+                {
+                    args.codex_bin = std::path::absolute(codex)?.to_string_lossy().into_owned();
+                } else {
+                    eprintln!(
+                        "warning: `{}` not found; app-server restarts will fail until --codex-bin is set",
+                        args.codex_bin
+                    );
+                }
                 command.extend(args.to_args());
                 if codex_switcher::config::ensure_daemon_auto_start(&storage.codex_home)? {
                     println!("Set [features] daemon_auto_start = true");

@@ -114,10 +114,10 @@ pub fn stop(targets: &[RunningProcess]) -> Result<Vec<u32>> {
     Ok(live.iter().map(|process| process.pid).collect())
 }
 
-/// Terminate app-server server processes, leaving clients (`app-server proxy`),
-/// other subcommands, and code-mode helpers alone. Processes launched by the
-/// managed daemon (under `app-server-daemon/`) are only included on request.
-pub fn stop_app_servers(include_managed: bool) -> Result<Vec<u32>> {
+/// Terminate app-server server processes that clients spawned themselves,
+/// leaving clients (`app-server proxy`), other subcommands, code-mode helpers,
+/// and the managed daemon (under `app-server-daemon/`) alone.
+pub fn stop_standalone_app_servers() -> Result<Vec<u32>> {
     #[cfg(unix)]
     {
         let output = Command::new("ps")
@@ -134,7 +134,7 @@ pub fn stop_app_servers(include_managed: bool) -> Result<Vec<u32>> {
             .filter(|process| process.pid != std::process::id())
             .filter(|process| {
                 is_app_server_daemon_process(&process.command)
-                    && (include_managed || !process.command.contains("app-server-daemon"))
+                    && !process.command.contains("app-server-daemon")
             })
             .map(|process| RunningProcess::new(process.pid, ProcessKind::CodexAppServer))
             .collect();
@@ -157,7 +157,6 @@ pub fn stop_app_servers(include_managed: bool) -> Result<Vec<u32>> {
 
     #[cfg(not(unix))]
     {
-        let _ = include_managed;
         anyhow::bail!("Stopping app-server processes is only supported on Unix")
     }
 }

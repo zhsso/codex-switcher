@@ -1,6 +1,6 @@
 //! Foreground watcher: poll the active account's usage and, when it runs out,
 //! switch to the saved account with the most quota and restart the app-server.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -148,38 +148,57 @@ fn log(message: impl std::fmt::Display) {
     eprintln!("[{}] {message}", Utc::now().format("%Y-%m-%d %H:%M:%S"));
 }
 
-fn codex_daemon(codex_bin: &str, action: &str) -> Result<()> {
-    let output = Command::new(codex_bin)
+/// Resolve the Codex executable: a path is used as given, a bare name is
+/// looked up on PATH, then in the managed daemon's install (service managers
+/// often run with a PATH that lacks npm or user bin directories).
+pub fn resolve_codex_bin(codex_bin: &str, codex_home: &Path) -> Option<PathBuf> {
+    if codex_bin.contains('/') {
+        return Some(PathBuf::from(codex_bin));
+    }
+    std::env::var_os("PATH")
+        .iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join(codex_bin))
+        .chain(
+            (codex_bin == "codex")
+                .then(|| codex_home.join("packages/app-server-daemon/current/bin/codex")),
+        )
+        .find(|path| path.is_file())
+}
+
+fn codex_daemon(settings: &Settings, codex_home: &Path, action: &str) -> Result<()> {
+    let codex = resolve_codex_bin(&settings.codex_bin, codex_home).with_context(|| {
+        format!(
+            "Could not find `{}` on PATH; pass --codex-bin with an absolute path",
+            settings.codex_bin
+        )
+    })?;
+    let output = Command::new(&codex)
         .args(["app-server", "daemon", action])
         .output()
-        .with_context(|| format!("Could not run {codex_bin}"))?;
+        .with_context(|| format!("Could not run {}", codex.display()))?;
     anyhow::ensure!(
         output.status.success(),
-        "`{codex_bin} app-server daemon {action}` failed: {}",
+        "`{} app-server daemon {action}` failed: {}",
+        codex.display(),
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
 }
 
 /// Stop app-servers that clients spawned themselves (e.g. the desktop app) so
-/// they reconnect through the managed daemon, then start or restart it.
-fn refresh_app_servers(codex_bin: &str, action: &str) -> Result<()> {
-    let stopped = processes::stop_app_servers(false)?;
+/// they reconnect through the managed daemon, then start or restart it. The
+/// managed daemon itself is only ever restarted through Codex: killing it
+/// directly leaves clients unable to reconnect.
+fn refresh_app_servers(settings: &Settings, codex_home: &Path, action: &str) -> Result<()> {
+    let stopped = processes::stop_standalone_app_servers()?;
     if !stopped.is_empty() {
         log(format!(
             "Stopped {} standalone app-server process(es)",
             stopped.len()
         ));
     }
-    if let Err(error) = codex_daemon(codex_bin, action) {
-        log(format!("{error:#}"));
-        if action == "restart" {
-            // Fallback: stop the managed daemon too; daemon_auto_start relaunches it.
-            let stopped = processes::stop_app_servers(true)?;
-            log(format!("Stopped {} app-server process(es)", stopped.len()));
-        }
-    }
-    Ok(())
+    codex_daemon(settings, codex_home, action)
 }
 
 /// One check. Returns how long to sleep before the next one.
@@ -260,7 +279,7 @@ async fn tick(storage: &Storage, settings: &Settings, state: &mut State) -> Resu
     state.active = Some(to);
     state.remaining_5h = window(next, "5h");
     if settings.manage_app_server {
-        refresh_app_servers(&settings.codex_bin, "restart")?;
+        refresh_app_servers(settings, &storage.codex_home, "restart")?;
         log("Restarted app-server");
     }
     Ok(next_interval(state.remaining_5h, settings))
@@ -271,7 +290,7 @@ pub async fn run(storage: &Storage, settings: Settings) -> Result<()> {
         log("Set [features] daemon_auto_start = true in config.toml");
     }
     if settings.manage_app_server {
-        if let Err(error) = refresh_app_servers(&settings.codex_bin, "start") {
+        if let Err(error) = refresh_app_servers(&settings, &storage.codex_home, "start") {
             log(format!("App-server cleanup failed: {error:#}"));
         }
     }
@@ -395,15 +414,20 @@ pub mod systemd {
         }
     }
 
-    pub fn render(args: &[String]) -> String {
+    /// `path` is the installing shell's PATH, so npm-installed `codex`
+    /// wrappers can find `node` under the service manager.
+    pub fn render(args: &[String], path: Option<&str>) -> String {
         let exec = args
             .iter()
             .map(|arg| quote(arg))
             .collect::<Vec<_>>()
             .join(" ");
+        let environment = path
+            .map(|path| format!("Environment={}\n", quote(&format!("PATH={path}"))))
+            .unwrap_or_default();
         format!(
             "[Unit]\nDescription=Codex account auto-switcher\nAfter=network-online.target\n\n\
-             [Service]\nExecStart={exec}\nRestart=on-failure\nRestartSec=30\n\n\
+             [Service]\n{environment}ExecStart={exec}\nRestart=on-failure\nRestartSec=30\n\n\
              [Install]\nWantedBy=default.target\n"
         )
     }
@@ -412,7 +436,8 @@ pub mod systemd {
     pub fn install(args: &[String]) -> Result<PathBuf> {
         let path = unit_path()?;
         std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(&path, render(args))?;
+        let shell_path = std::env::var("PATH").ok();
+        std::fs::write(&path, render(args, shell_path.as_deref()))?;
         systemctl(&["daemon-reload"])?;
         systemctl(&["enable", "--now", UNIT])?;
         systemctl(&["restart", UNIT])?;
@@ -506,18 +531,37 @@ mod tests {
         assert_eq!(earliest_reset(&rows[1..4], 1.0), Some(5000));
     }
 
+    #[test]
+    fn falls_back_to_the_managed_daemon_binary() {
+        let home = tempfile::tempdir().unwrap();
+        let missing = "codex-switcher-test-missing-binary";
+        assert!(resolve_codex_bin(missing, home.path()).is_none());
+        assert_eq!(
+            resolve_codex_bin("/opt/x/codex", home.path()),
+            Some(PathBuf::from("/opt/x/codex"))
+        );
+        let managed = home.path().join("packages/app-server-daemon/current/bin");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join("codex"), "").unwrap();
+        let resolved = resolve_codex_bin("codex", home.path()).unwrap();
+        assert!(resolved.is_file());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn unit_quotes_arguments() {
-        let unit = systemd::render(&[
-            "/usr/bin/codex-switcher".into(),
-            "--store-dir".into(),
-            "/home/a b/s".into(),
-            "daemon".into(),
-            "run".into(),
-        ]);
+        let unit = systemd::render(
+            &[
+                "/usr/bin/codex-switcher".into(),
+                "--store-dir".into(),
+                "/home/a b/s".into(),
+                "daemon".into(),
+                "run".into(),
+            ],
+            Some("/home/a b/bin:/usr/bin"),
+        );
         assert!(unit.contains(
-            "ExecStart=/usr/bin/codex-switcher --store-dir \"/home/a b/s\" daemon run\n"
+            "Environment=\"PATH=/home/a b/bin:/usr/bin\"\nExecStart=/usr/bin/codex-switcher --store-dir \"/home/a b/s\" daemon run\n"
         ));
     }
 }
