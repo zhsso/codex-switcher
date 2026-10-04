@@ -145,7 +145,10 @@ fn earliest_reset(rows: &[AccountUsage], threshold: f64) -> Option<i64> {
 }
 
 fn log(message: impl std::fmt::Display) {
-    eprintln!("[{}] {message}", Utc::now().format("%Y-%m-%d %H:%M:%S"));
+    eprintln!(
+        "[{}] {message}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z")
+    );
 }
 
 /// Resolve the Codex executable: a path is used as given, a bare name is
@@ -338,21 +341,26 @@ pub async fn run(storage: &Storage, settings: Settings) -> Result<()> {
     }
 }
 
-/// Sleep for `wait`. While paused, also watch (locally, without network) for
-/// a manual switch and resume as soon as one happens.
+/// Sleep for `wait`, measured against the wall clock in short steps: the
+/// monotonic clock stops while the machine is suspended, which would delay a
+/// check scheduled for a quota reset. While paused, also watch (locally,
+/// without network) for a manual switch and resume as soon as one happens.
 async fn sleep(storage: &Storage, settings: &Settings, state: &mut State, wait: Duration) {
-    let Some(paused_id) = state.paused_active_id.clone() else {
-        tokio::time::sleep(wait).await;
-        return;
-    };
-    let deadline = tokio::time::Instant::now() + wait;
+    let deadline = Utc::now() + chrono::Duration::from_std(wait).unwrap_or(chrono::TimeDelta::MAX);
     let step = settings.min_interval.min(Duration::from_secs(30));
-    while tokio::time::Instant::now() < deadline {
-        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + step)).await;
+    let paused_id = state.paused_active_id.clone();
+    while let Ok(remaining) = deadline.signed_duration_since(Utc::now()).to_std() {
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(remaining.min(step)).await;
+        let Some(paused_id) = &paused_id else {
+            continue;
+        };
         let active = accounts::load_current(storage)
             .ok()
             .and_then(|store| store.active_account_id);
-        if active.is_some_and(|id| id != paused_id) {
+        if active.is_some_and(|id| &id != paused_id) {
             log("Active account changed manually; resuming");
             break;
         }
