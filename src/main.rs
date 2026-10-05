@@ -5,8 +5,7 @@ use std::sync::atomic::Ordering;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use codex_switcher::{
-    accounts, app_server, auth, daemon, processes, status, storage::Storage, types::StoredAccount,
-    usage,
+    accounts, app_server, auth, processes, status, storage::Storage, types::StoredAccount, usage,
 };
 
 #[derive(Parser)]
@@ -28,7 +27,7 @@ struct Cli {
     /// Codex executable used to control the app-server daemon
     #[arg(long, global = true, default_value = "codex")]
     codex_bin: String,
-    /// Never stop, start, or restart app-server processes (switch, edit, daemon)
+    /// Skip restarting app-server processes after a manual switch
     #[arg(long, global = true)]
     no_restart: bool,
     #[command(subcommand)]
@@ -96,89 +95,6 @@ enum Command {
         #[arg(short, long)]
         yes: bool,
     },
-    /// Watch the active account's usage and auto-switch when it runs out
-    Daemon {
-        #[command(subcommand)]
-        action: DaemonAction,
-    },
-}
-
-#[derive(Subcommand)]
-enum DaemonAction {
-    /// Run the watcher in the foreground (used by the systemd unit)
-    Run(DaemonArgs),
-    /// Install and start a systemd user service running `daemon run` (Linux)
-    Install(DaemonArgs),
-    /// Stop and remove the systemd user service (Linux)
-    Uninstall,
-    /// Start the installed systemd user service (Linux)
-    Start,
-    /// Stop the installed systemd user service (Linux)
-    Stop,
-    /// Restart the installed systemd user service (Linux)
-    Restart,
-    /// Show the watcher's last check, next check, and last switch
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Args)]
-struct DaemonArgs {
-    /// Switch when the active account's remaining percent falls below this
-    #[arg(long, default_value_t = 1.0)]
-    threshold: f64,
-    /// Shortest polling interval in seconds (used when the 5h quota is nearly spent)
-    #[arg(long, default_value_t = 30)]
-    min_interval: u64,
-    /// Longest polling interval in seconds (used when over 50% of 5h quota is left)
-    #[arg(long, default_value_t = 600)]
-    max_interval: u64,
-    /// Minimum seconds between automatic switches
-    #[arg(long, default_value_t = 300)]
-    cooldown: u64,
-    /// Backend base URL receiving the account token (Codex path selection)
-    #[arg(long, default_value = usage::DEFAULT_BASE_URL)]
-    base_url: String,
-}
-
-impl DaemonArgs {
-    fn settings(&self, codex_bin: &str, no_restart: bool) -> Result<daemon::Settings> {
-        anyhow::ensure!(
-            self.threshold.is_finite() && (0.0..100.0).contains(&self.threshold),
-            "--threshold must be between 0 and 100"
-        );
-        anyhow::ensure!(
-            0 < self.min_interval && self.min_interval <= self.max_interval,
-            "--min-interval must be positive and not exceed --max-interval"
-        );
-        Ok(daemon::Settings {
-            threshold: self.threshold,
-            min_interval: std::time::Duration::from_secs(self.min_interval),
-            max_interval: std::time::Duration::from_secs(self.max_interval),
-            cooldown: std::time::Duration::from_secs(self.cooldown),
-            base_url: self.base_url.clone(),
-            codex_bin: codex_bin.to_owned(),
-            manage_app_server: !no_restart,
-        })
-    }
-
-    #[cfg(target_os = "linux")]
-    fn to_args(&self) -> Vec<String> {
-        vec![
-            "--threshold".into(),
-            self.threshold.to_string(),
-            "--min-interval".into(),
-            self.min_interval.to_string(),
-            "--max-interval".into(),
-            self.max_interval.to_string(),
-            "--cooldown".into(),
-            self.cooldown.to_string(),
-            "--base-url".into(),
-            self.base_url.clone(),
-        ]
-    }
 }
 
 #[derive(Args)]
@@ -193,7 +109,7 @@ struct Source {
 
 /// Make running Codex clients pick up the account now in auth.json.
 fn restart_app_servers(storage: &Storage, codex_bin: &str) -> Result<()> {
-    let refresh = app_server::refresh(codex_bin, &storage.codex_home, "restart").context(
+    let refresh = app_server::restart(codex_bin, &storage.codex_home).context(
         "Restarting the app-server failed; running Codex sessions keep the previous account until it restarts",
     )?;
     if refresh.config_changed {
@@ -247,8 +163,6 @@ async fn run(cli: Cli) -> Result<()> {
             }
         },
     };
-    #[cfg(target_os = "linux")]
-    let explicit_dirs = (cli.store_dir.clone(), cli.codex_home.clone());
     let storage = Storage::new(cli.store_dir, cli.codex_home)?;
     match cli.command {
         Command::Add {
@@ -309,11 +223,8 @@ async fn run(cli: Cli) -> Result<()> {
                 None
             };
             let name = name.map(|name| name.trim().to_owned());
-            let (name, live) = accounts::edit(&storage, &account, name, replacement)?;
+            let (name, _) = accounts::edit(&storage, &account, name, replacement)?;
             println!("Updated {name}");
-            if live && !cli.no_restart {
-                restart_app_servers(&storage, &cli.codex_bin)?;
-            }
         }
         Command::Switch { account } => {
             let selector = account.join(" ");
@@ -405,86 +316,6 @@ async fn run(cli: Cli) -> Result<()> {
             closed += processes::stop(&running)?.len();
             println!("Closed {closed} process(es).");
         }
-        Command::Daemon { action } => match action {
-            DaemonAction::Run(args) => {
-                daemon::run(&storage, args.settings(&cli.codex_bin, cli.no_restart)?).await?
-            }
-            #[cfg(target_os = "linux")]
-            DaemonAction::Install(args) => {
-                args.settings(&cli.codex_bin, cli.no_restart)?;
-                let exe = std::env::current_exe()?;
-                let mut command = vec![exe.to_string_lossy().into_owned()];
-                let (store_dir, codex_home) = explicit_dirs;
-                // Pin both directories so the service sees the same files as this shell.
-                command.extend([
-                    "--store-dir".into(),
-                    std::path::absolute(store_dir.unwrap_or(storage.directory.clone()))?
-                        .to_string_lossy()
-                        .into_owned(),
-                    "--codex-home".into(),
-                    std::path::absolute(codex_home.unwrap_or(storage.codex_home.clone()))?
-                        .to_string_lossy()
-                        .into_owned(),
-                    "daemon".into(),
-                    "run".into(),
-                ]);
-                command.extend(args.to_args());
-                // Service managers run with a minimal PATH; pin the executable.
-                let codex_bin = match app_server::resolve_codex_bin(
-                    &cli.codex_bin,
-                    &storage.codex_home,
-                ) {
-                    Some(codex) => std::path::absolute(codex)?.to_string_lossy().into_owned(),
-                    None => {
-                        eprintln!(
-                            "warning: `{}` not found; app-server restarts will fail until --codex-bin is set",
-                            cli.codex_bin
-                        );
-                        cli.codex_bin.clone()
-                    }
-                };
-                command.extend(["--codex-bin".into(), codex_bin]);
-                if cli.no_restart {
-                    command.push("--no-restart".into());
-                }
-                if codex_switcher::config::ensure_daemon_auto_start(&storage.codex_home)? {
-                    println!("Set [features] daemon_auto_start = true");
-                }
-                let path = daemon::systemd::install(&command)?;
-                println!("Installed and started {}", path.display());
-                println!("Logs: journalctl --user -u {} -f", daemon::systemd::UNIT);
-            }
-            #[cfg(target_os = "linux")]
-            DaemonAction::Uninstall => {
-                println!("Removed {}", daemon::systemd::uninstall()?.display());
-            }
-            #[cfg(target_os = "linux")]
-            DaemonAction::Start | DaemonAction::Stop | DaemonAction::Restart => {
-                let (action, done) = match action {
-                    DaemonAction::Start => ("start", "Started"),
-                    DaemonAction::Stop => ("stop", "Stopped"),
-                    _ => ("restart", "Restarted"),
-                };
-                daemon::systemd::control(action)?;
-                println!("{done} {}", daemon::systemd::UNIT);
-            }
-            #[cfg(not(target_os = "linux"))]
-            DaemonAction::Install(_)
-            | DaemonAction::Uninstall
-            | DaemonAction::Start
-            | DaemonAction::Stop
-            | DaemonAction::Restart => {
-                anyhow::bail!("Service installation is only supported on Linux; run `daemon run` under your own supervisor")
-            }
-            DaemonAction::Status { json } => {
-                let state = daemon::read_state(&storage)?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&state)?);
-                } else {
-                    print!("{}", theme.daemon(state.as_ref()));
-                }
-            }
-        },
     }
     Ok(())
 }

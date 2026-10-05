@@ -56,13 +56,13 @@ pub struct Refresh {
     pub stopped: Vec<u32>,
 }
 
-/// Route every client through the managed daemon, then start or restart it:
+/// Route clients through the managed app-server after a manual account switch:
 /// enable `daemon_auto_start`, stop app-servers that clients spawned
-/// themselves (e.g. the desktop app), and run `codex app-server daemon <action>`.
-pub fn refresh(codex_bin: &str, codex_home: &Path, action: &str) -> Result<Refresh> {
+/// themselves (e.g. the desktop app), and run `codex app-server daemon restart`.
+pub fn restart(codex_bin: &str, codex_home: &Path) -> Result<Refresh> {
     let config_changed = config::ensure_daemon_auto_start(codex_home)?;
     let stopped = processes::stop_standalone_app_servers()?;
-    daemon_command(codex_bin, codex_home, action)?;
+    daemon_command(codex_bin, codex_home, "restart")?;
     Ok(Refresh {
         config_changed,
         stopped,

@@ -1,8 +1,8 @@
 # Codex Switcher CLI
 
-一个独立的 Rust 命令行账号管理工具，提供 `add`、`remove`、`edit`、`switch`，用于查看账号列表与实时用量的 `list`、`status`，以及额度耗尽时自动切换账号的 `daemon`。
+一个独立的 Rust 命令行账号管理工具，提供 `add`、`remove`、`edit`、`switch`，用于查看账号列表与实时用量的 `list`、`status`。
 
-已移除 Tauri/React GUI、Web UI、托盘、后台进程监控、自动预热和自动更新。无需 Node.js、pnpm 或桌面环境；默认不运行后台服务，自动切换需显式启用 `daemon`。查看和关闭进程由 `ps`、`stop` 命令显式执行。
+已移除 Tauri/React GUI、Web UI、托盘、后台进程监控、自动预热和自动更新。无需 Node.js、pnpm 或桌面环境，不运行后台服务。查看和关闭进程由 `ps`、`stop` 命令显式执行。
 
 ## 安装
 
@@ -69,7 +69,7 @@ codex-switcher remove personal
 
 `add` 不自动切换；需要激活新账号时显式运行 `switch`。`edit` 保留账号 ID、创建时间和使用记录；替换当前账号的凭据时也会更新当前 `auth.json`。
 
-运行中的 app-server 不会重新加载属于其他账号的 `auth.json`，因此 `switch` 以及替换当前账号凭据的 `edit` 完成后会重启 app-server：确保 `[features] daemon_auto_start = true`，关闭客户端自行拉起的 app-server，再运行 `codex app-server daemon restart`，已连接的 CLI 会自动重连，进行中的任务会被中断。全局参数 `--no-restart` 跳过这一步，`--codex-bin` 指定 Codex 可执行文件（默认 `codex`，PATH 中找不到时使用 `$CODEX_HOME/packages/app-server-daemon/current/bin/codex`）。重名、空名称、未知账号、无效认证文件和参数冲突会返回非零退出码。
+运行中的 app-server 不会重新加载属于其他账号的 `auth.json`，因此 手动 `switch` 成功后会重启 app-server：确保 `[features] daemon_auto_start = true`，关闭客户端自行拉起的 app-server，再运行 `codex app-server daemon restart`，已连接的 CLI 会自动重连，进行中的任务会被中断。`edit` 不会触发重启。全局参数 `--no-restart` 跳过手动切换后的重启，`--codex-bin` 指定 Codex 可执行文件（默认 `codex`，PATH 中找不到时使用 `$CODEX_HOME/packages/app-server-daemon/current/bin/codex`）。重名、空名称、未知账号、无效认证文件和参数冲突会返回非零退出码。
 
 OAuth 登录仅在命令执行期间启动本地回调监听器，默认端口为 `1455`，占用时选择空闲端口；等待最多五分钟，可用 Ctrl+C 取消。远程主机上的登录需要浏览器能够访问该主机的回调端口。
 
@@ -135,32 +135,3 @@ cargo clippy --all-targets --locked -- -D warnings
 ```
 
 测试使用临时目录、虚构凭据和本地模拟 HTTP 服务，不修改实际账号或请求真实 OAuth token。
-
-## 自动切换（daemon）
-
-```sh
-codex-switcher daemon install        # Linux：安装并启动 systemd 用户服务
-codex-switcher daemon status         # 上次检查、下次检查、最近一次切换
-codex-switcher daemon status --json
-codex-switcher daemon stop           # 停止服务（start / restart 同理）
-codex-switcher daemon uninstall      # 停止并删除服务
-codex-switcher daemon run            # 前台运行，Ctrl+C 退出
-journalctl --user -u codex-switcher.service -f   # 查看日志
-```
-
-启动时会把 `$CODEX_HOME/config.toml` 中的 `[features] daemon_auto_start` 自动设为 `true`（保留原有注释与格式），关闭客户端自行拉起的 app-server（如桌面端的 `/usr/lib/chatgpt/resources/codex ... app-server`），再运行 `codex app-server daemon start`，使客户端统一连接托管 daemon。`app-server proxy` 等子命令和 Codex CLI 自身的进程不受影响。
-
-守护进程定期查询当前账号用量，按 5h 剩余百分比调整频率：高于 50% 时为 `--max-interval`，20–50% 为其 1/2，5–20% 为其 1/5，更低时为 `--min-interval`。任一窗口（5h 或每周）剩余低于 `--threshold` 时，查询全部账号，在所有窗口均高于阈值的账号中选择 5h 剩余最多的一个，执行与 `switch` 相同的切换；随后关闭客户端自行拉起的 app-server 并运行 `codex app-server daemon restart`，由 Codex 关闭旧的托管 app-server 并启动新的，已连接的 CLI 会自动重连。托管 app-server 从不被直接终止（直接终止会导致客户端无法重连）。重启会直接中断进行中的任务。
-
-所有账号都不可用时暂停：不再查询也不切换，直到最早有账号额度重置（`daemon status` 显示 `Paused until`），届时重新查询并选择账号。暂停期间手动 `switch` 到其他账号或 `daemon restart` 会立即恢复检查。
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--threshold` | `1` | 剩余百分比低于此值时切换 |
-| `--min-interval` | `30` | 最短检查间隔（秒） |
-| `--max-interval` | `600` | 最长检查间隔（秒） |
-| `--cooldown` | `300` | 两次自动切换的最小间隔（秒） |
-| `--codex-bin` | `codex` | 全局参数，见上文；`daemon install` 会写入其绝对路径和当前 PATH |
-| `--no-restart` | 关 | 全局参数，只切换账号，不关闭、启动或重启任何 app-server |
-
-`daemon install` 接受相同参数，并把它们与当前的 `--store-dir`、`--codex-home` 写入服务。查询失败时按指数退避重试。API key 账号不受监控，也不会被选为切换目标。
