@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use codex_switcher::{
     accounts, app_server, auth, processes, status, storage::Storage, types::StoredAccount, usage,
+    warmup,
 };
 
 #[derive(Parser)]
@@ -78,6 +79,16 @@ enum Command {
         #[arg(long)]
         json: bool,
         /// Backend base URL receiving the account token (Codex path selection)
+        #[arg(long, default_value = usage::DEFAULT_BASE_URL)]
+        base_url: String,
+    },
+    /// Send hi with gpt-6-luna when the account's 5h usage is zero
+    Warmup {
+        /// Exact account name or full ID; omit to check all accounts
+        account: Option<String>,
+        #[arg(long)]
+        json: bool,
+        /// Backend base URL receiving the account token
         #[arg(long, default_value = usage::DEFAULT_BASE_URL)]
         base_url: String,
     },
@@ -250,6 +261,22 @@ async fn run(cli: Cli) -> Result<()> {
             anyhow::ensure!(
                 !report.iter().any(|row| row.status == "error"),
                 "Some usage queries failed; see per-account errors above"
+            );
+        }
+        Command::Warmup {
+            account,
+            json,
+            base_url,
+        } => {
+            let report = warmup::run(&storage, account.as_deref(), &base_url).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", theme.warmup(&report));
+            }
+            anyhow::ensure!(
+                !report.iter().any(|row| row.status == "error"),
+                "Some warmups failed; see per-account errors above"
             );
         }
         Command::List { json } => {

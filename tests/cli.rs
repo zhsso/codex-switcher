@@ -100,6 +100,135 @@ fn oauth_auth(identity: &str, suffix: &str) -> Value {
     }})
 }
 
+fn warmup_server(request_count: usize) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    use tiny_http::{Response, Server};
+    let server = Server::http("127.0.0.1:0").unwrap();
+    let root = format!("http://{}", server.server_addr());
+    let handle = std::thread::spawn(move || {
+        let mut posted = Vec::new();
+        for _ in 0..request_count {
+            let mut request = server
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .expect("missing request");
+            let header = |name: &'static str| {
+                request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv(name))
+                    .unwrap()
+                    .value
+                    .as_str()
+                    .to_owned()
+            };
+            let id = header("chatgpt-account-id");
+            assert_eq!(header("authorization"), format!("Bearer access-{id}"));
+            if request.method().as_str() == "GET" {
+                assert_eq!(request.url(), "/api/codex/usage");
+                let window = json!({"used_percent": if id == "used" {0.1} else {0.0}, "limit_window_seconds":18000});
+                let limits = match id.as_str() {
+                    "missing" => {
+                        json!({"primary_window":{"used_percent":0,"limit_window_seconds":604800}})
+                    }
+                    "secondary" => json!({"secondary_window":window}),
+                    _ => json!({"primary_window":window}),
+                };
+                request
+                    .respond(
+                        Response::from_string(json!({"rate_limit":limits}).to_string())
+                            .with_status_code(if id == "usage-error" { 403 } else { 200 }),
+                    )
+                    .unwrap();
+            } else {
+                assert_eq!(request.method().as_str(), "POST");
+                assert_eq!(request.url(), "/api/codex/responses");
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let body: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(body["model"], "gpt-6-luna");
+                assert_eq!(body["input"][0]["content"][0]["text"], "hi");
+                assert_eq!(body["stream"], true);
+                assert_eq!(body["store"], false);
+                let event = if id == "post-error" {
+                    json!({"type":"response.failed","error":{"message":"access-secret"}})
+                } else {
+                    json!({"type":"response.completed","response":{"status":"completed"}})
+                };
+                request
+                    .respond(Response::from_string(format!("data: {event}\n\n")))
+                    .unwrap();
+                posted.push(id);
+            }
+        }
+        assert!(server
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .unwrap()
+            .is_none());
+        posted
+    });
+    (root, handle)
+}
+
+#[test]
+fn warmup_all_checks_exact_5h_zero_and_continues_after_errors() {
+    let fixture = Fixture::new();
+    for name in [
+        "zero",
+        "used",
+        "missing",
+        "usage-error",
+        "post-error",
+        "secondary",
+    ] {
+        fixture.write_auth(&oauth_auth(name, name));
+        fixture.ok(&["add", name]);
+    }
+    fixture.key("api", "sk-test");
+    let before = fs::read(fixture.storage().auth_path()).unwrap();
+    let store_before = fs::read(fixture.storage().directory.join("accounts.json")).unwrap();
+    let (root, server) = warmup_server(9);
+    let output = fixture.run(&["warmup", "--base-url", &root, "--json"]);
+    assert!(!output.status.success());
+    let rows: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let statuses: Vec<_> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        statuses,
+        ["warmed", "skipped", "skipped", "error", "error", "warmed", "skipped"]
+    );
+    assert_eq!(server.join().unwrap(), ["zero", "post-error", "secondary"]);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("access-"));
+    assert_eq!(fs::read(fixture.storage().auth_path()).unwrap(), before);
+    assert_eq!(
+        fs::read(fixture.storage().directory.join("accounts.json")).unwrap(),
+        store_before
+    );
+    assert!(!fixture.storage().codex_home.join("config.toml").exists());
+}
+
+#[test]
+fn warmup_selects_exact_name_or_id_and_handles_empty_and_unknown() {
+    let fixture = Fixture::new();
+    assert_eq!(fixture.ok(&["warmup", "--json"]).trim(), "[]");
+    assert!(!fixture.run(&["warmup", "unknown"]).status.success());
+    fixture.write_auth(&oauth_auth("zero", "zero"));
+    fixture.ok(&["add", "So Zhang@example.com"]);
+    fixture.key("other", "sk-other");
+    let id = fixture.list()[0]["id"].as_str().unwrap().to_owned();
+    for selector in ["So Zhang@example.com", &id] {
+        let (root, server) = warmup_server(2);
+        let output = fixture.ok(&["warmup", selector, "--base-url", &root, "--json"]);
+        let rows: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["status"], "warmed");
+        assert_eq!(server.join().unwrap(), ["zero"]);
+    }
+}
+
 #[test]
 fn account_lifecycle_by_name_and_id() {
     let fixture = Fixture::new();

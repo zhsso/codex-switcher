@@ -32,6 +32,29 @@ impl Theme {
         )
     }
 
+    pub fn warmup(&self, rows: &[crate::warmup::WarmupResult]) -> String {
+        let mut out = format!("\n  {}\n", self.paint("Account warmup", "1;96"));
+        if rows.is_empty() {
+            out.push_str("\n    No saved accounts.\n");
+        }
+        for row in rows {
+            let color = match row.status {
+                "warmed" => "92",
+                "error" => "91",
+                _ => "93",
+            };
+            let _ = writeln!(
+                out,
+                "\n{}\n    {}  {}",
+                self.heading(&row.name, false),
+                self.paint(row.status, color),
+                clean(&row.message)
+            );
+        }
+        out.push('\n');
+        out
+    }
+
     pub fn usage(&self, rows: &[AccountUsage]) -> String {
         let mut out = format!(
             "\n  {}  {}\n",

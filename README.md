@@ -1,8 +1,19 @@
 # Codex Switcher CLI
 
-一个独立的 Rust 命令行账号管理工具，提供 `add`、`remove`、`edit`、`switch`，用于查看账号列表与实时用量的 `list`、`status`。
+一个独立的 Rust 命令行账号管理工具，提供 `add`、`remove`、`edit`、`switch`，用于查看账号列表与实时用量的 `list`、`status`，以及按需预热账号的 `warmup`。
 
 已移除 Tauri/React GUI、Web UI、托盘、后台进程监控、自动预热和自动更新。无需 Node.js、pnpm 或桌面环境，不运行后台服务。查看和关闭进程由 `ps`、`stop` 命令显式执行。
+
+## 最新更新
+
+### 2026-10-06
+
+#### 新增
+
+- 增加 `warmup [账号]`，支持预热指定账号或检查全部账号；仅在 5 小时窗口已用量为 0 时，用 `gpt-6-luna` 发送 `hi`。
+- 预热结果显示成功、跳过或失败原因，支持 JSON 输出；单个账号失败后继续处理其他账号。
+
+完整记录见 [发布记录](docs/releases/release-notes.md)。
 
 ## 安装
 
@@ -109,6 +120,21 @@ codex-switcher list --color never
 查询优先使用当前本地凭据；遇到 HTTP 401 时重新读取凭据，必要时刷新并保存 token 后重试一次。HTTP 403 不触发刷新。查询不会切换当前账号、启动后台监控或发送预热请求。仅当刷新的是当前账号时同步其 `auth.json`。
 
 `list`（也可用 `ls`）保留本地凭据状态与本地套餐信息，不联网、不写入文件。`status` 和 `list` 均不输出密钥或 token。
+
+## 手动预热
+
+```sh
+codex-switcher warmup                     # 检查所有账号并预热符合条件的账号
+codex-switcher warmup work                # 指定精确名称或完整 ID
+codex-switcher warmup "So Zhang"           # 含空格的名称需加引号
+codex-switcher warmup --json               # 输出每个账号的处理结果
+```
+
+每次先查询实时用量，仅当明确的 5 小时窗口（`limit_window_seconds = 18000`）的 `used_percent` 等于 `0` 时，使用该账号的凭据向 `gpt-6-luna` 发送 `hi`。已有用量、缺少 5 小时窗口或 API key 账号会跳过；不会根据重置倒计时推测用量为零。预热会产生实际模型用量，不保证显示的整数百分比立即变化。
+
+结果为 `warmed`、`skipped` 或 `error`，并显示原因。等待响应完成后才报告成功；模型不可用、HTTP 错误或流式响应失败会报告错误，不自动换模型。单个账号失败后继续处理其他账号，最终退出码为 1；全部成功或跳过时为 0。命令不切换账号、不重启 app-server，也不启动后台任务。
+
+支持与 `status` 相同的 `--base-url <URL>`（默认 `https://chatgpt.com/backend-api`）。默认预热路径为 `/backend-api/codex/responses`，自定义后端不含 `/backend-api` 时为 `/api/codex/responses`；后端会接收账号认证信息。用量查询复用现有 token 刷新机制，预热读取刷新后的凭据；预热请求本身失败时不自动重试。
 
 ## 数据与切换
 

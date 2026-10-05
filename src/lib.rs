@@ -9,3 +9,4 @@ pub mod status;
 pub mod storage;
 pub mod types;
 pub mod usage;
+pub mod warmup;

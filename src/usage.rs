@@ -182,7 +182,7 @@ impl UsageClient {
 
 // Follow openai/codex's backend-client PathStyle and rate_limit_status_url.
 // Parse the hostname exactly instead of matching a URL string prefix.
-fn usage_url(base_url: &str) -> Result<String> {
+pub(crate) fn usage_url(base_url: &str) -> Result<String> {
     let mut url = url::Url::parse(base_url).context("Invalid backend base URL")?;
     anyhow::ensure!(
         matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
