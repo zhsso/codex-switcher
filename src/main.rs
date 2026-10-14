@@ -28,7 +28,7 @@ struct Cli {
     /// Codex executable used to control the app-server daemon
     #[arg(long, global = true, default_value = "codex")]
     codex_bin: String,
-    /// Skip restarting app-server processes after a manual switch
+    /// Skip restarting app-server processes after a manual switch or relogin
     #[arg(long, global = true)]
     no_restart: bool,
     #[command(subcommand)]
@@ -67,10 +67,19 @@ enum Command {
         #[command(flatten)]
         source: Source,
     },
-    /// Save the live session, refresh the target if needed, and write auth.json
-    Switch {
+    /// Sign in again through the browser and replace a saved account's credentials
+    Relogin {
         /// Exact name or full ID; multiple shell words are joined with spaces
         #[arg(required = true, num_args = 1..)]
+        account: Vec<String>,
+        /// Print the login URL without opening a browser
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Switch to an account, or cycle to the next saved account when omitted
+    Switch {
+        /// Exact name or full ID; omit to cycle; multiple words are joined with spaces
+        #[arg(num_args = 0..)]
         account: Vec<String>,
     },
     /// Fetch usage and reset times for an account, or all saved accounts
@@ -136,6 +145,28 @@ fn restart_app_servers(storage: &Storage, codex_bin: &str) -> Result<()> {
     Ok(())
 }
 
+/// Run the browser OAuth flow until it completes, fails, or Ctrl-C cancels it.
+async fn oauth_login(name: String, no_browser: bool) -> Result<StoredAccount> {
+    let (info, receiver, cancelled) = auth::oauth::start_oauth_login(name).await?;
+    eprintln!(
+        "Open this URL to sign in (waiting up to 5 minutes):\n{}",
+        info.auth_url
+    );
+    if !no_browser {
+        if let Err(error) = webbrowser::open(&info.auth_url) {
+            eprintln!("Could not open browser: {error}. Open the URL above manually.");
+        }
+    }
+    tokio::select! {
+        account = auth::oauth::wait_for_oauth_login(receiver) => account,
+        signal = tokio::signal::ctrl_c() => {
+            signal?;
+            cancelled.store(true, Ordering::Relaxed);
+            anyhow::bail!("Login cancelled");
+        }
+    }
+}
+
 fn import(storage: &Storage, source: &Source, name: String) -> Result<StoredAccount> {
     if source.api_key_stdin {
         let mut key = String::new();
@@ -190,24 +221,7 @@ async fn run(cli: Cli) -> Result<()> {
                 accounts::validate_name(&storage.load()?, &name, None)?;
             }
             let account = if login {
-                let (info, receiver, cancelled) = auth::oauth::start_oauth_login(name).await?;
-                eprintln!(
-                    "Open this URL to sign in (waiting up to 5 minutes):\n{}",
-                    info.auth_url
-                );
-                if !no_browser {
-                    if let Err(error) = webbrowser::open(&info.auth_url) {
-                        eprintln!("Could not open browser: {error}. Open the URL above manually.");
-                    }
-                }
-                tokio::select! {
-                    account = auth::oauth::wait_for_oauth_login(receiver) => account?,
-                    signal = tokio::signal::ctrl_c() => {
-                        signal?;
-                        cancelled.store(true, Ordering::Relaxed);
-                        anyhow::bail!("Login cancelled");
-                    }
-                }
+                oauth_login(name, no_browser).await?
             } else {
                 import(&storage, &source, name)?
             };
@@ -237,12 +251,35 @@ async fn run(cli: Cli) -> Result<()> {
             let (name, _) = accounts::edit(&storage, &account, name, replacement)?;
             println!("Updated {name}");
         }
+        Command::Relogin {
+            account,
+            no_browser,
+        } => {
+            let selector = account.join(" ");
+            // Fail on an unknown account before opening the browser.
+            let store = accounts::load_current(&storage)?;
+            let previous = &store.accounts[accounts::resolve(&store, &selector)?];
+            let previous_email = previous.email.clone();
+            let replacement = oauth_login(previous.name.clone(), no_browser).await?;
+            if let (Some(old), Some(new)) = (&previous_email, &replacement.email) {
+                if !old.eq_ignore_ascii_case(new) {
+                    eprintln!("warning: signed in as {new}, previously {old}");
+                }
+            }
+            let (name, update_live) = accounts::edit(&storage, &selector, None, Some(replacement))?;
+            println!("Signed in again as {name}");
+            if update_live && !cli.no_restart {
+                restart_app_servers(&storage, &cli.codex_bin)?;
+            }
+        }
         Command::Switch { account } => {
             let selector = account.join(" ");
-            println!(
-                "Switched to {}",
+            let name = if account.is_empty() {
+                accounts::switch_next(&storage).await?
+            } else {
                 accounts::switch(&storage, &selector).await?
-            );
+            };
+            println!("Switched to {name}");
             if !cli.no_restart {
                 restart_app_servers(&storage, &cli.codex_bin)?;
             }

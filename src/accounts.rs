@@ -162,9 +162,31 @@ pub fn edit(
 }
 
 pub async fn switch(storage: &Storage, selector: &str) -> Result<String> {
+    switch_target(storage, Some(selector)).await
+}
+
+/// Cycle in saved order, starting at the first account if none is active.
+pub async fn switch_next(storage: &Storage) -> Result<String> {
+    switch_target(storage, None).await
+}
+
+async fn switch_target(storage: &Storage, selector: Option<&str>) -> Result<String> {
     let _lock = storage.lock()?;
     let mut store = load_current(storage)?;
-    let index = resolve(&store, selector)?;
+    let index = match selector {
+        Some(selector) => resolve(&store, selector)?,
+        None => {
+            anyhow::ensure!(
+                !store.accounts.is_empty(),
+                "No saved accounts; run `codex-switcher add NAME` first"
+            );
+            store
+                .accounts
+                .iter()
+                .position(|account| store.active_account_id.as_deref() == Some(&account.id))
+                .map_or(0, |index| (index + 1) % store.accounts.len())
+        }
+    };
     // Preserve live rotated tokens before any network request or auth.json write.
     storage.save(&store)?;
     let (account, deferred_error) = refresh_if_needed(&store.accounts[index]).await?;

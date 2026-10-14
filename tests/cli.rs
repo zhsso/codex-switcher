@@ -230,6 +230,41 @@ fn warmup_selects_exact_name_or_id_and_handles_empty_and_unknown() {
 }
 
 #[test]
+fn switch_without_account_cycles_in_saved_order() {
+    let fixture = Fixture::new();
+    fixture.key("one", "sk-one-test");
+    fixture.key("two", "sk-two-test");
+    fixture.key("three", "sk-three-test");
+    for name in ["one", "two", "three", "one"] {
+        assert!(fixture
+            .ok(&["switch"])
+            .contains(&format!("Switched to {name}")));
+        assert_eq!(fixture.auth()["OPENAI_API_KEY"], format!("sk-{name}-test"));
+    }
+    // Follow the actual live login, even if it changed outside this tool.
+    fixture.write_auth(&json!({"OPENAI_API_KEY": "sk-two-test"}));
+    fixture.ok(&["switch"]);
+    assert_eq!(fixture.auth()["OPENAI_API_KEY"], "sk-three-test");
+    fixture.write_auth(&json!({"OPENAI_API_KEY": "sk-external-test"}));
+    fixture.ok(&["switch"]);
+    assert_eq!(fixture.auth()["OPENAI_API_KEY"], "sk-one-test");
+}
+
+#[test]
+fn switch_without_account_handles_empty_and_single_account() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&["switch"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No saved accounts"));
+    assert!(!fixture.storage().auth_path().exists());
+    fixture.key("one", "sk-one-test");
+    for _ in 0..2 {
+        fixture.ok(&["switch"]);
+        assert_eq!(fixture.auth()["OPENAI_API_KEY"], "sk-one-test");
+    }
+}
+
+#[test]
 fn account_lifecycle_by_name_and_id() {
     let fixture = Fixture::new();
     fixture.key("personal", "sk-personal-test");
@@ -466,6 +501,17 @@ fn malformed_credentials_and_conflicting_sources_fail_before_writes() {
     ] {
         assert_eq!(fixture.run(&args).status.code(), Some(2));
     }
+}
+
+#[test]
+fn relogin_rejects_unknown_accounts_before_starting_oauth() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&["relogin", "missing", "--no-browser"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not found"));
+    assert!(!stderr.contains("Open this URL"));
+    assert_eq!(fixture.run(&["relogin"]).status.code(), Some(2));
 }
 
 #[test]

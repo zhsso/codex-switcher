@@ -1,17 +1,16 @@
 # Codex Switcher CLI
 
-一个独立的 Rust 命令行账号管理工具，提供 `add`、`remove`、`edit`、`switch`，用于查看账号列表与实时用量的 `list`、`status`，以及按需预热账号的 `warmup`。
+一个独立的 Rust 命令行账号管理工具，提供 `add`、`remove`、`edit`、`relogin`、`switch`，用于查看账号列表与实时用量的 `list`、`status`，以及按需预热账号的 `warmup`。
 
 已移除 Tauri/React GUI、Web UI、托盘、后台进程监控、自动预热和自动更新。无需 Node.js、pnpm 或桌面环境，不运行后台服务。查看和关闭进程由 `ps`、`stop` 命令显式执行。
 
 ## 最新更新
 
-### 2026-10-06
+### 2026-10-15
 
 #### 新增
 
-- 增加 `warmup [账号]`，支持预热指定账号或检查全部账号；仅在 5 小时窗口已用量为 0 时，用 `gpt-6-luna` 发送 `hi`。
-- 预热结果显示成功、跳过或失败原因，支持 JSON 输出；单个账号失败后继续处理其他账号。
+- `switch` 不带账号时按保存顺序轮转，末尾回到第一个；没有当前账号时选择第一个。
 
 完整记录见 [发布记录](docs/releases/release-notes.md)。
 
@@ -66,6 +65,7 @@ codex-switcher stop --yes
 
 # 按精确名称或完整 ID 切换
 codex-switcher switch work
+codex-switcher switch                # 不带账号：切到下一个，末尾回到第一个
 codex-switcher switch So Zhang       # 名称含空格时无需加引号
 codex-switcher switch work --no-restart   # 只切换，不重启 app-server
 
@@ -73,6 +73,11 @@ codex-switcher switch work --no-restart   # 只切换，不重启 app-server
 codex-switcher edit work --name company
 codex-switcher edit company --file /path/to/new-auth.json
 codex-switcher edit api --api-key-stdin < /path/to/new-api-key.txt
+
+# 重新登录指定账号（令牌失效时），替换其凭据并保留名称和 ID；
+# 若为当前账号，同时更新 auth.json 并重启 app-server（--no-restart 跳过）
+codex-switcher relogin work
+codex-switcher relogin work --no-browser
 
 # 从保存的账号列表中删除，不登出 Codex，也不自动切换其他账号
 codex-switcher remove personal
