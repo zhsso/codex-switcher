@@ -6,11 +6,11 @@
 
 ## 最新更新
 
-### 2026-10-15
+### 2026-10-31
 
-#### 新增
+#### 优化
 
-- `switch` 不带账号时按保存顺序轮转，末尾回到第一个；没有当前账号时选择第一个。
+- 所有业务子命令的 `--help` 补充参数说明、关键行为与使用示例，可直接在终端查看添加、切换、重新登录等操作的完整用法。
 
 完整记录见 [发布记录](docs/releases/release-notes.md)。
 
@@ -33,6 +33,13 @@ cargo build --release --locked
 ```
 
 ## 使用
+
+使用 `codex-switcher <子命令> --help` 或 `codex-switcher help <子命令>` 查看详细说明和示例，例如：
+
+```sh
+codex-switcher add --help
+codex-switcher help switch
+```
 
 ```sh
 # 保存当前 Codex auth.json 中的登录信息，不切换账号

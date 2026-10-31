@@ -13,7 +13,7 @@ use codex_switcher::{
 #[command(
     version,
     about = "Manage and switch Codex accounts",
-    after_help = "Account selectors accept an exact name or full ID. Use `list` (alias: `ls`) to see saved accounts."
+    after_help = "Account selectors accept an exact name or full ID. Use `list` (alias: `ls`) to see saved accounts.\n\nRun `codex-switcher <COMMAND> --help` or `codex-switcher help <COMMAND>` for details and examples."
 )]
 struct Cli {
     /// Terminal colors; auto respects NO_COLOR and disables colors in pipes
@@ -45,6 +45,22 @@ enum ColorMode {
 #[derive(Subcommand)]
 enum Command {
     /// Save an account; defaults to importing the current Codex auth.json
+    #[command(
+        after_help = r#"With no source option, imports auth.json from --codex-home, CODEX_HOME, or ~/.codex.
+Choose one source: --file, --api-key-stdin, or --login. --no-browser requires --login.
+Omit NAME to generate a name from the email or account identity; names must be unique.
+Adding an account does not switch to it. Run `codex-switcher switch NAME` to activate it.
+Browser login waits up to 5 minutes; press Ctrl+C to cancel.
+
+Examples:
+  codex-switcher add personal
+  codex-switcher add work --login
+  codex-switcher add --login
+  codex-switcher add work --login --no-browser
+  codex-switcher add work --file /path/to/auth.json
+  codex-switcher add api --api-key-stdin < /path/to/api-key.txt
+  codex-switcher add "So Zhang" --login"#
+    )]
     Add {
         /// Display name; defaults to the email or account identity
         name: Option<String>,
@@ -58,16 +74,56 @@ enum Command {
         no_browser: bool,
     },
     /// Forget a saved account without changing the current Codex login
-    Remove { account: String },
-    /// Rename an account and/or replace its credentials
-    Edit {
+    #[command(
+        after_help = r#"Accepts an exact name or full ID from `codex-switcher list`.
+Only removes the saved profile; Codex stays logged in and no other account is selected.
+Quote names containing spaces.
+
+Examples:
+  codex-switcher remove work
+  codex-switcher remove "So Zhang""#
+    )]
+    Remove {
+        /// Exact account name or full ID
         account: String,
+    },
+    /// Rename an account and/or replace its credentials
+    #[command(
+        after_help = r#"Provide --name, --file, or --api-key-stdin; renaming and replacing credentials can be combined.
+Keeps the account ID, creation time, and usage history. Replacing the current account's
+credentials also updates auth.json. Does not restart app-server.
+Use `codex-switcher relogin ACCOUNT` to replace credentials through browser login.
+Quote names containing spaces.
+
+Examples:
+  codex-switcher edit work --name company
+  codex-switcher edit company --file /path/to/new-auth.json
+  codex-switcher edit work --name company --file /path/to/new-auth.json
+  codex-switcher edit api --api-key-stdin < /path/to/api-key.txt
+  codex-switcher edit "So Zhang" --name personal"#
+    )]
+    Edit {
+        /// Exact account name or full ID
+        account: String,
+        /// New display name; must be nonblank and unique
         #[arg(long)]
         name: Option<String>,
         #[command(flatten)]
         source: Source,
     },
     /// Sign in again through the browser and replace a saved account's credentials
+    #[command(
+        after_help = r#"Keeps the account name, ID, creation time, and usage history.
+For the current account, also updates auth.json and restarts app-server; ongoing tasks
+may be interrupted. Use --no-restart to skip the restart.
+Login waits up to 5 minutes; press Ctrl+C to cancel. Names may contain multiple words.
+
+Examples:
+  codex-switcher relogin work
+  codex-switcher relogin work --no-browser
+  codex-switcher relogin work --no-restart
+  codex-switcher relogin So Zhang"#
+    )]
     Relogin {
         /// Exact name or full ID; multiple shell words are joined with spaces
         #[arg(required = true, num_args = 1..)]
@@ -77,39 +133,112 @@ enum Command {
         no_browser: bool,
     },
     /// Switch to an account, or cycle to the next saved account when omitted
+    #[command(
+        after_help = r#"Accepts an exact name or full ID from `codex-switcher list`.
+Without ACCOUNT, cycles in saved order and wraps from the last account to the first.
+If no account is active, selects the first saved account.
+Writes the selected credentials to auth.json and restarts app-server so connected
+clients pick up the account. Ongoing tasks may be interrupted; --no-restart skips this restart.
+Names may contain multiple words.
+
+Examples:
+  codex-switcher switch
+  codex-switcher switch work
+  codex-switcher switch So Zhang
+  codex-switcher switch work --no-restart"#
+    )]
     Switch {
         /// Exact name or full ID; omit to cycle; multiple words are joined with spaces
         #[arg(num_args = 0..)]
         account: Vec<String>,
     },
     /// Fetch usage and reset times for an account, or all saved accounts
+    #[command(
+        after_help = r#"Omit ACCOUNT to query all saved accounts. Accepts an exact name or full ID;
+quote names containing spaces. API key accounts are reported as unsupported.
+Shows live usage windows, remaining percentages, and reset times without switching accounts.
+JSON output is always an array, including for a single account. Failed queries are
+reported per account; other accounts are still queried and the command exits with code 1.
+
+Examples:
+  codex-switcher status
+  codex-switcher status work
+  codex-switcher status "So Zhang" --json
+  codex-switcher status --json"#
+    )]
     Status {
+        /// Exact account name or full ID; omit to query all accounts
         account: Option<String>,
+        /// Output a JSON array instead of formatted text
         #[arg(long)]
         json: bool,
-        /// Backend base URL receiving the account token (Codex path selection)
+        /// Backend base URL, not a usage endpoint; receives the account token and ID
         #[arg(long, default_value = usage::DEFAULT_BASE_URL)]
         base_url: String,
     },
     /// Send hi with gpt-6-luna when the account's 5h usage is zero
+    #[command(
+        after_help = r#"Omit ACCOUNT to check all saved accounts. Accepts an exact name or full ID;
+quote names containing spaces. Queries live usage, then sends hi with gpt-6-luna only
+when the 5-hour window reports exactly 0% used. This produces real model usage.
+Skips API key accounts, accounts with existing usage, and accounts without a 5-hour window.
+Does not switch accounts or restart app-server. Results are warmed, skipped, or error;
+errors do not stop other accounts from being checked, and result in exit code 1.
+
+Examples:
+  codex-switcher warmup
+  codex-switcher warmup work
+  codex-switcher warmup "So Zhang" --json
+  codex-switcher warmup --json"#
+    )]
     Warmup {
         /// Exact account name or full ID; omit to check all accounts
         account: Option<String>,
+        /// Output a JSON array of per-account results instead of formatted text
         #[arg(long)]
         json: bool,
-        /// Backend base URL receiving the account token
+        /// Backend base URL, not a responses endpoint; receives the account token and ID
         #[arg(long, default_value = usage::DEFAULT_BASE_URL)]
         base_url: String,
     },
     /// Show saved accounts without credentials or network requests
-    #[command(alias = "ls")]
+    #[command(
+        alias = "ls",
+        after_help = r#"Lists local account names, full IDs, and credential status. * marks the account
+matching the current Codex auth.json. Does not query live usage; use `status` for that.
+Credentials are never included in text or JSON output. Alias: ls.
+
+Examples:
+  codex-switcher list
+  codex-switcher ls
+  codex-switcher list --json"#
+    )]
     List {
+        /// Output a JSON array instead of formatted text
         #[arg(long)]
         json: bool,
     },
     /// Show running Codex CLI, Codex desktop, app-server, and ChatGPT processes
+    #[command(
+        after_help = r#"Displays detected processes for review before running `codex-switcher stop`.
+Listing processes does not close them.
+
+Examples:
+  codex-switcher ps"#
+    )]
     Ps,
     /// Gracefully close the listed Codex, app-server, and ChatGPT processes
+    #[command(
+        after_help = r#"Lists detected processes and asks for confirmation before requesting a graceful shutdown.
+Use --yes to skip confirmation, including when standard input is not a terminal.
+Stops managed app-server daemons through Codex; leaves the app-server updater running.
+Unsaved work may be lost. Processes that do not exit are not forcibly killed.
+
+Examples:
+  codex-switcher ps
+  codex-switcher stop
+  codex-switcher stop --yes"#
+    )]
     Stop {
         /// Close without prompting for confirmation
         #[arg(short, long)]
