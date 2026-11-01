@@ -100,44 +100,57 @@ impl Theme {
                     self.paint("Usage / reset not returned by server", "93")
                 );
             }
-            for window in &row.windows {
-                let filled = (window.used_percent.clamp(0., 100.) / 100. * 20.).round() as usize;
-                let bar = format!(
-                    "{}{}",
-                    self.paint(&"━".repeat(filled), "91"),
-                    self.paint(&"━".repeat(20 - filled), "92")
-                );
-                let _ = writeln!(out, "\n    {}", self.paint(&clean(&window.label), "1;97"));
-                let _ = writeln!(
-                    out,
-                    "      {bar}  {} used · {} left",
-                    self.paint(&format!("{:.1}%", window.used_percent), "91"),
-                    self.paint(&format!("{:.1}%", window.remaining_percent), "92")
-                );
-                let time = window
-                    .resets_at
-                    .map(|time| {
-                        time.with_timezone(&Local)
-                            .format("%Y-%m-%d %H:%M:%S %:z")
-                            .to_string()
-                    })
-                    .unwrap_or_else(|| "unknown".into());
-                let countdown = window
-                    .resets_in_seconds
-                    .map(countdown)
-                    .unwrap_or_else(|| "unknown".into());
-                let _ = writeln!(
-                    out,
-                    "      {} {} {}  {}",
-                    self.paint("resets in", "37"),
-                    self.paint(&countdown, "96"),
-                    self.paint("at", "37"),
-                    time,
-                );
+            // Windows are sorted shortest first: 5h on the left, weekly on the right.
+            for pair in row.windows.chunks(2) {
+                let columns: Vec<[String; 4]> =
+                    pair.iter().map(|window| self.window_cell(window)).collect();
+                out.push('\n');
+                for line in 0..4 {
+                    let mut text = String::from("    ");
+                    for (index, column) in columns.iter().enumerate() {
+                        text.push_str(&column[line]);
+                        if index + 1 < columns.len() {
+                            let pad = COLUMN_WIDTH.saturating_sub(visible_len(&column[line]));
+                            text.push_str(&" ".repeat(pad));
+                        }
+                    }
+                    let _ = writeln!(out, "{}", text.trim_end());
+                }
             }
         }
         out.push('\n');
         out
+    }
+
+    fn window_cell(&self, window: &crate::usage::UsageWindow) -> [String; 4] {
+        let filled = (window.used_percent.clamp(0., 100.) / 100. * 20.).round() as usize;
+        let bar = format!(
+            "{}{}",
+            self.paint(&"━".repeat(filled), "91"),
+            self.paint(&"━".repeat(20 - filled), "92")
+        );
+        let countdown = window
+            .resets_in_seconds
+            .map(countdown)
+            .unwrap_or_else(|| "unknown".into());
+        let time = window
+            .resets_at
+            .map(|time| time.with_timezone(&Local).format("%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "unknown".into());
+        [
+            self.paint(&clean(&window.label), "1;97"),
+            format!(
+                "{bar}  {}",
+                self.paint(&format!("{:.1}% used", window.used_percent), "91")
+            ),
+            format!(
+                "{} {} {}",
+                self.paint(&format!("{:.1}% left", window.remaining_percent), "92"),
+                self.paint("· resets in", "37"),
+                self.paint(&countdown, "96"),
+            ),
+            format!("{} {time}", self.paint("at", "37")),
+        ]
     }
 
     pub fn accounts(&self, rows: &[AccountStatus]) -> String {
@@ -220,6 +233,26 @@ impl Theme {
         out.push('\n');
         out
     }
+}
+
+const COLUMN_WIDTH: usize = 40;
+
+// Display width ignoring ANSI color sequences; all rendered glyphs are single-width.
+fn visible_len(value: &str) -> usize {
+    let mut len = 0;
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            for next in chars.by_ref() {
+                if next == 'm' {
+                    break;
+                }
+            }
+        } else {
+            len += 1;
+        }
+    }
+    len
 }
 
 fn countdown(seconds: i64) -> String {
