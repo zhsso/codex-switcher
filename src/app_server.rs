@@ -61,7 +61,7 @@ pub struct Refresh {
 /// themselves (e.g. the desktop app), and run `codex app-server daemon restart`.
 pub fn restart(codex_bin: &str, codex_home: &Path) -> Result<Refresh> {
     let config_changed = config::ensure_daemon_auto_start(codex_home)?;
-    let stopped = processes::stop_standalone_app_servers()?;
+    let stopped = processes::stop_standalone_app_servers(codex_home)?;
     daemon_command(codex_bin, codex_home, "restart")?;
     Ok(Refresh {
         config_changed,

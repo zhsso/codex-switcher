@@ -21,13 +21,23 @@ impl Storage {
                 Some(path) => path,
                 None => home()?.join(".codex-switcher"),
             },
-            codex_home: match codex_home
-                .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
-            {
+            codex_home: match codex_home.or_else(|| {
+                std::env::var_os("CODEX_HOME")
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+            }) {
                 Some(path) => path,
                 None => home()?.join(".codex"),
             },
         })
+    }
+
+    /// The same account store, operating on a different Codex home.
+    pub fn with_home(&self, codex_home: PathBuf) -> Self {
+        Self {
+            directory: self.directory.clone(),
+            codex_home,
+        }
     }
 
     /// The OS releases this lock even if the CLI is interrupted or crashes.
@@ -109,6 +119,12 @@ impl Storage {
         };
         write_private_json(&self.auth_path(), &auth)
     }
+}
+
+/// Compare paths by what they resolve to, falling back to their spelling.
+pub fn same_path(left: &Path, right: &Path) -> bool {
+    let resolve = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    resolve(left) == resolve(right)
 }
 
 /// Write credentials atomically, with owner-only permissions from creation on Unix.

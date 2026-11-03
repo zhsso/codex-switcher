@@ -152,12 +152,16 @@ impl UsageClient {
                             "Token refresh failed; sign in again or check your connection"
                         )
                     })?;
+                let peer_homes = accounts::peer_homes_using(storage, current);
                 store.accounts[index] = updated.clone();
                 storage.save(&store)?;
                 if store.active_account_id.as_deref() == Some(&updated.id) {
                     // Preserve a rotated refresh token in both files even when
                     // the returned ID token is unusable.
                     storage.write_auth(&updated)?;
+                }
+                for home in peer_homes {
+                    storage.with_home(home).write_auth(&updated)?;
                 }
                 if let Some(error) = deferred_error {
                     return Err(error);
@@ -476,6 +480,27 @@ mod tests {
         assert_eq!(rows[0].status, "ok");
         assert!(rows[0].windows.is_empty());
         assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn refreshed_tokens_reach_the_fork_using_the_account() {
+        let (_dir, storage, account) = setup();
+        let (fork, _) = crate::fork::create(&storage, "work", &account.id)
+            .await
+            .unwrap();
+        let refreshed =
+            json!({"id_token":jwt(), "access_token":"new-access", "refresh_token":"new-refresh"})
+                .to_string();
+        let (client, server) = mock(vec![(401, "{}".into()), (200, refreshed), (200, payload())]);
+        let rows = query_with_client(&storage, Some(&account.id), &client)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].status, "ok");
+        server.join().unwrap();
+        let auth = storage.with_home(fork).read_auth().unwrap().unwrap();
+        assert_eq!(auth.tokens.unwrap().refresh_token, "new-refresh");
+        assert!(!storage.auth_path().exists());
     }
 
     #[tokio::test]

@@ -1,12 +1,12 @@
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use codex_switcher::{
-    accounts, app_server, auth, processes, status, storage::Storage, types::StoredAccount, usage,
-    warmup,
+    accounts, app_server, auth, fork, processes, status, storage::Storage, types::StoredAccount,
+    usage, warmup,
 };
 
 #[derive(Parser)]
@@ -244,6 +244,71 @@ Examples:
         #[arg(short, long)]
         yes: bool,
     },
+    /// Create isolated Codex homes so accounts can run at the same time
+    #[command(
+        after_help = r#"A fork is a separate CODEX_HOME logged in to its own account, with its own
+sessions, state, and app-server daemon. Skills and plugins are shared with the
+home it was forked from; config.toml is copied. An account can only be in use by
+one home at a time. Linux only.
+
+Examples:
+  codex-switcher fork create work --account so
+  codex-switcher fork run work
+  codex-switcher fork run work codex resume --last
+  codex-switcher fork run work codex-switcher switch other
+  codex-switcher fork shell work
+  codex-switcher fork list
+  codex-switcher fork remove work"#
+    )]
+    Fork {
+        #[command(subcommand)]
+        command: ForkCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ForkCommand {
+    /// Create a fork of the current Codex home, logged in to a saved account
+    Create {
+        /// Fork name: letters, digits, '.', '_' or '-'
+        name: String,
+        /// Exact account name or full ID; must not be in use by another home
+        #[arg(long)]
+        account: String,
+    },
+    /// List forks and the account each one is using
+    #[command(visible_alias = "ls")]
+    List {
+        /// Print machine-readable JSON instead of formatted text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a command with CODEX_HOME set to a fork (default: codex)
+    Run {
+        /// Fork name
+        name: String,
+        /// Command and arguments to run instead of codex
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Start a shell with CODEX_HOME set to a fork; `exit` leaves it
+    Shell {
+        /// Fork name
+        name: String,
+    },
+    /// Print a fork's directory, for use as CODEX_HOME
+    Path {
+        /// Fork name
+        name: String,
+    },
+    /// Stop a fork's app-server daemon and delete the fork, including its sessions
+    Remove {
+        /// Fork name
+        name: String,
+        /// Delete without prompting for confirmation
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[derive(Args)]
@@ -258,7 +323,11 @@ struct Source {
 
 /// Make running Codex clients pick up the account now in auth.json.
 fn restart_app_servers(storage: &Storage, codex_bin: &str) -> Result<()> {
-    let refresh = app_server::restart(codex_bin, &storage.codex_home).context(
+    restart_home_app_servers(&storage.codex_home, codex_bin)
+}
+
+fn restart_home_app_servers(codex_home: &Path, codex_bin: &str) -> Result<()> {
+    let refresh = app_server::restart(codex_bin, codex_home).context(
         "Restarting the app-server failed; running Codex sessions keep the previous account until it restarts",
     )?;
     if refresh.config_changed {
@@ -395,10 +464,12 @@ async fn run(cli: Cli) -> Result<()> {
                     eprintln!("warning: signed in as {new}, previously {old}");
                 }
             }
-            let (name, update_live) = accounts::edit(&storage, &selector, None, Some(replacement))?;
+            let (name, live_homes) = accounts::edit(&storage, &selector, None, Some(replacement))?;
             println!("Signed in again as {name}");
-            if update_live && !cli.no_restart {
-                restart_app_servers(&storage, &cli.codex_bin)?;
+            if !cli.no_restart {
+                for home in &live_homes {
+                    restart_home_app_servers(home, &cli.codex_bin)?;
+                }
             }
         }
         Command::Switch { account } => {
@@ -466,11 +537,11 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Ps => {
-            let running = processes::list_running()?;
+            let running = processes::list_running(&storage.codex_home)?;
             print!("{}", theme.processes(&running));
         }
         Command::Stop { yes } => {
-            let running = processes::list_running()?;
+            let running = processes::list_running(&storage.codex_home)?;
             print!("{}", theme.processes(&running));
             if running.iter().any(|process| !process.kind.is_closable()) {
                 println!("The app-server updater is left running.");
@@ -506,9 +577,82 @@ async fn run(cli: Cli) -> Result<()> {
                     .filter(|process| process.managed && process.kind.is_closable())
                     .count();
             }
-            closed += processes::stop(&running)?.len();
+            closed += processes::stop(&running, &storage.codex_home)?.len();
             println!("Closed {closed} process(es).");
         }
+        Command::Fork { command } => match command {
+            ForkCommand::Create { name, account } => {
+                let (_, account) = fork::create(&storage, &name, &account).await?;
+                println!("Created fork {name} using {account}");
+                println!("Run: codex-switcher fork run {name}");
+            }
+            ForkCommand::List { json } => {
+                let forks = fork::list(&storage)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&forks)?);
+                } else if forks.is_empty() {
+                    println!("No forks.");
+                } else {
+                    for fork in forks {
+                        println!(
+                            "{}  {}  {}",
+                            fork.name,
+                            fork.account.as_deref().unwrap_or("(no saved account)"),
+                            fork.path.display()
+                        );
+                    }
+                }
+            }
+            ForkCommand::Run { name, command } => {
+                let path = fork::path(&storage, &name)?;
+                match command.split_first() {
+                    Some((program, args)) => fork::exec(&path, program.as_ref(), args)?,
+                    None => {
+                        let codex = app_server::resolve_codex_bin(&cli.codex_bin, &path)
+                            .with_context(|| {
+                                format!(
+                                    "Could not find `{}` on PATH; pass --codex-bin with an absolute path",
+                                    cli.codex_bin
+                                )
+                            })?;
+                        fork::exec(&path, codex.as_os_str(), &[])?
+                    }
+                }
+            }
+            ForkCommand::Shell { name } => {
+                let path = fork::path(&storage, &name)?;
+                let shell = std::env::var_os("SHELL")
+                    .filter(|shell| !shell.is_empty())
+                    .unwrap_or_else(|| "/bin/sh".into());
+                eprintln!("Using fork {name}; type `exit` to leave");
+                fork::exec(&path, &shell, &[])?
+            }
+            ForkCommand::Path { name } => {
+                println!("{}", fork::path(&storage, &name)?.display());
+            }
+            ForkCommand::Remove { name, yes } => {
+                let path = fork::path(&storage, &name)?;
+                if !yes {
+                    anyhow::ensure!(
+                        io::stdin().is_terminal(),
+                        "confirmation requires a terminal; use `fork remove --yes` to proceed"
+                    );
+                    eprint!(
+                        "Delete {} including its sessions and history? [y/N] ",
+                        path.display()
+                    );
+                    io::stderr().flush()?;
+                    let mut answer = String::new();
+                    io::stdin().read_line(&mut answer)?;
+                    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                        println!("Cancelled.");
+                        return Ok(());
+                    }
+                }
+                fork::remove(&storage, &name, &cli.codex_bin)?;
+                println!("Removed fork {name}");
+            }
+        },
     }
     Ok(())
 }

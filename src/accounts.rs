@@ -1,6 +1,12 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
 
-use crate::auth::{refresh::refresh_if_needed, sync::sync_active_account_tokens};
+use crate::auth::{
+    refresh::refresh_if_needed,
+    sync::{sync_account_tokens, sync_active_account_tokens},
+};
+use crate::fork;
 use crate::storage::Storage;
 use crate::types::{
     parse_chatgpt_id_token_claims, AccountsStore, AuthData, AuthDotJson, StoredAccount,
@@ -88,8 +94,51 @@ pub fn reconcile(store: &mut AccountsStore, auth: Option<&AuthDotJson>) {
     sync_active_account_tokens(store, auth);
 }
 
+/// The saved account an auth.json belongs to, when that is unambiguous.
+pub fn account_for_auth<'a>(
+    store: &'a AccountsStore,
+    auth: &AuthDotJson,
+) -> Option<&'a StoredAccount> {
+    let mut matches = store
+        .accounts
+        .iter()
+        .filter(|account| matches_auth(account, auth));
+    let account = matches.next()?;
+    matches.next().is_none().then_some(account)
+}
+
+/// Other Codex homes currently logged in to this account.
+pub fn peer_homes_using(storage: &Storage, account: &StoredAccount) -> Vec<PathBuf> {
+    fork::peer_auths(storage)
+        .into_iter()
+        .filter(|(_, auth)| matches_auth(account, auth))
+        .map(|(home, _)| home)
+        .collect()
+}
+
+/// A rotating refresh token only works in one place. API keys can be shared.
+fn holder<'a>(account: &StoredAccount, peers: &'a [(PathBuf, AuthDotJson)]) -> Option<&'a Path> {
+    if !matches!(account.auth_data, AuthData::ChatGPT { .. }) {
+        return None;
+    }
+    peers
+        .iter()
+        .find(|(_, auth)| matches_auth(account, auth))
+        .map(|(home, _)| home.as_path())
+}
+
+/// Tokens rotate wherever the account is running, so collect them from every
+/// known home. The current home goes last: its auth.json wins any conflict.
 pub fn load_current(storage: &Storage) -> Result<AccountsStore> {
     let mut store = storage.load()?;
+    for (_, auth) in fork::peer_auths(storage) {
+        let Some(id) = account_for_auth(&store, &auth).map(|account| account.id.clone()) else {
+            continue;
+        };
+        if let Some(account) = store.accounts.iter_mut().find(|account| account.id == id) {
+            sync_account_tokens(account, &auth);
+        }
+    }
     reconcile(&mut store, storage.read_auth()?.as_ref());
     Ok(store)
 }
@@ -130,13 +179,13 @@ pub fn remove(storage: &Storage, selector: &str) -> Result<String> {
 }
 
 /// Credential edits retain the profile ID, creation time and display name.
-/// Returns the name and whether the live auth.json was rewritten.
+/// Returns the name and the Codex homes whose live auth.json was rewritten.
 pub fn edit(
     storage: &Storage,
     selector: &str,
     name: Option<String>,
     replacement: Option<StoredAccount>,
-) -> Result<(String, bool)> {
+) -> Result<(String, Vec<PathBuf>)> {
     let _lock = storage.lock()?;
     let mut store = load_current(storage)?;
     let index = resolve(&store, selector)?;
@@ -149,16 +198,22 @@ pub fn edit(
     updated.last_used_at = account.last_used_at;
     updated.name = name.clone();
     // Save credentials first: if writing auth.json fails, a retry can recover them.
-    let update_live =
-        replacement.is_some() && store.active_account_id.as_deref() == Some(&updated.id);
+    let mut live_homes = Vec::new();
+    if replacement.is_some() {
+        if store.active_account_id.as_deref() == Some(&updated.id) {
+            live_homes.push(storage.codex_home.clone());
+        }
+        live_homes.extend(peer_homes_using(storage, account));
+    }
     store.accounts[index] = updated.clone();
     storage.save(&store)?;
-    if update_live {
+    for home in &live_homes {
         storage
+            .with_home(home.clone())
             .write_auth(&updated)
             .context("Profile saved, but updating the active auth.json failed; run switch again")?;
     }
-    Ok((name, update_live))
+    Ok((name, live_homes))
 }
 
 pub async fn switch(storage: &Storage, selector: &str) -> Result<String> {
@@ -173,18 +228,34 @@ pub async fn switch_next(storage: &Storage) -> Result<String> {
 async fn switch_target(storage: &Storage, selector: Option<&str>) -> Result<String> {
     let _lock = storage.lock()?;
     let mut store = load_current(storage)?;
+    let peers = fork::peer_auths(storage);
     let index = match selector {
-        Some(selector) => resolve(&store, selector)?,
+        Some(selector) => {
+            let index = resolve(&store, selector)?;
+            if let Some(home) = holder(&store.accounts[index], &peers) {
+                anyhow::bail!(
+                    "Account '{}' is already in use by Codex home {}; using it in two homes would invalidate its login",
+                    store.accounts[index].name,
+                    home.display()
+                );
+            }
+            index
+        }
         None => {
+            let count = store.accounts.len();
             anyhow::ensure!(
-                !store.accounts.is_empty(),
+                count > 0,
                 "No saved accounts; run `codex-switcher add NAME` first"
             );
-            store
+            let start = store
                 .accounts
                 .iter()
                 .position(|account| store.active_account_id.as_deref() == Some(&account.id))
-                .map_or(0, |index| (index + 1) % store.accounts.len())
+                .map_or(0, |index| index + 1);
+            (0..count)
+                .map(|offset| (start + offset) % count)
+                .find(|&index| holder(&store.accounts[index], &peers).is_none())
+                .context("Every saved account is in use by another Codex home")?
         }
     };
     // Preserve live rotated tokens before any network request or auth.json write.

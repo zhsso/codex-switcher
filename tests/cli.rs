@@ -648,3 +648,226 @@ fn status_uses_official_codex_api_route_and_auth_headers_for_custom_backend() {
     assert_eq!(rows[0]["windows"][0]["used_percent"], 12.0);
     assert_eq!(rows[0]["windows"][0]["resets_in_seconds"], 600);
 }
+
+#[cfg(target_os = "linux")]
+mod forks {
+    use super::*;
+
+    /// Two saved OAuth accounts, with `a` active in the main home.
+    fn fork_fixture() -> Fixture {
+        let fixture = Fixture::new();
+        let files = fixture.0.path().join("auth");
+        fs::create_dir_all(&files).unwrap();
+        for name in ["a", "b"] {
+            let file = files.join(name);
+            fs::write(&file, oauth_auth(name, name).to_string()).unwrap();
+            fixture.ok(&["add", name, "--file", file.to_str().unwrap()]);
+        }
+        fixture.ok(&["switch", "a"]);
+        fixture
+    }
+
+    fn fork_home(fixture: &Fixture, name: &str) -> std::path::PathBuf {
+        fixture.ok(&["fork", "path", name]).trim().into()
+    }
+
+    #[test]
+    fn fork_keeps_only_what_codex_needs_and_shares_customizations() {
+        let fixture = fork_fixture();
+        let codex = fixture.storage().codex_home;
+        fs::write(codex.join("config.toml"), "model = \"custom\"\n").unwrap();
+        for directory in ["skills", "sessions", "packages"] {
+            fs::create_dir_all(codex.join(directory)).unwrap();
+        }
+        for file in ["auth.json.other", "history.jsonl", "state_5.sqlite"] {
+            fs::write(codex.join(file), "private").unwrap();
+        }
+
+        let output = fixture.ok(&["fork", "create", "work", "--account", "b"]);
+        assert!(output.contains("Created fork work using b"));
+        let home = fork_home(&fixture, "work");
+
+        let auth: Value =
+            serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth["tokens"]["refresh_token"], "refresh-b");
+        assert_eq!(fixture.auth()["tokens"]["refresh_token"], "refresh-a");
+
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(config.contains("model = \"custom\""));
+        assert!(config.contains("daemon_auto_start = true"));
+        assert!(fs::symlink_metadata(home.join("skills"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        for private in [
+            "sessions",
+            "packages",
+            "auth.json.other",
+            "history.jsonl",
+            "state_5.sqlite",
+        ] {
+            assert!(!home.join(private).exists(), "{private} was copied");
+        }
+
+        let forks: Value = serde_json::from_str(&fixture.ok(&["fork", "list", "--json"])).unwrap();
+        assert_eq!(forks[0]["name"], "work");
+        assert_eq!(forks[0]["account"], "b");
+    }
+
+    #[test]
+    fn an_oauth_account_can_only_be_used_by_one_home() {
+        let fixture = fork_fixture();
+        let refused = fixture.run(&["fork", "create", "work", "--account", "a"]);
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("already in use"));
+        assert!(fixture.run(&["fork", "path", "work"]).status.code() == Some(1));
+        assert!(!fixture.storage().directory.join("homes/work").exists());
+
+        fixture.ok(&["fork", "create", "work", "--account", "b"]);
+        let refused = fixture.run(&["switch", "b"]);
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("already in use"));
+        assert_eq!(fixture.auth()["tokens"]["refresh_token"], "refresh-a");
+
+        // Rotation skips the account held by the fork and stays on the only free one.
+        assert!(fixture.ok(&["switch"]).contains("Switched to a"));
+    }
+
+    #[test]
+    fn api_key_accounts_can_be_shared_between_homes() {
+        let fixture = Fixture::new();
+        fixture.key("key", "sk-shared");
+        fixture.ok(&["switch", "key"]);
+        fixture.ok(&["fork", "create", "work", "--account", "key"]);
+        let home = fork_home(&fixture, "work");
+        assert!(fs::read_to_string(home.join("auth.json"))
+            .unwrap()
+            .contains("sk-shared"));
+    }
+
+    #[test]
+    fn tokens_rotated_in_a_fork_survive_its_removal_and_reach_a_new_login() {
+        let fixture = fork_fixture();
+        fixture.ok(&["fork", "create", "work", "--account", "b"]);
+        let home = fork_home(&fixture, "work");
+        fs::write(
+            home.join("auth.json"),
+            oauth_auth("b", "rotated").to_string(),
+        )
+        .unwrap();
+
+        // Without --yes and without a terminal, nothing is deleted.
+        let refused = fixture
+            .command(&["fork", "remove", "work"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert!(home.exists());
+
+        fixture.ok(&["fork", "remove", "work", "--yes"]);
+        assert!(!home.exists());
+        assert!(fixture.storage().codex_home.exists());
+
+        fixture.ok(&["switch", "b"]);
+        assert_eq!(fixture.auth()["tokens"]["refresh_token"], "refresh-rotated");
+    }
+
+    #[test]
+    fn fork_run_sets_codex_home_and_keeps_the_exit_code() {
+        let fixture = fork_fixture();
+        fixture.ok(&["fork", "create", "work", "--account", "b"]);
+        let home = fork_home(&fixture, "work");
+
+        let output = fixture.ok(&["fork", "run", "work", "sh", "-c", "echo $CODEX_HOME"]);
+        assert_eq!(output.trim(), home.to_str().unwrap());
+
+        let failed = fixture.run(&["fork", "run", "work", "--", "sh", "-c", "exit 7"]);
+        assert_eq!(failed.status.code(), Some(7));
+
+        let missing = fixture.run(&["fork", "run", "nope", "true"]);
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("not found"));
+    }
+
+    #[test]
+    fn fork_run_defaults_to_codex() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = fork_fixture();
+        fixture.ok(&["fork", "create", "work", "--account", "b"]);
+        let script = fixture.0.path().join("fake-codex");
+        fs::write(&script, "#!/bin/sh\necho \"fake $CODEX_HOME\"\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = fixture.ok(&[
+            "--codex-bin",
+            script.to_str().unwrap(),
+            "fork",
+            "run",
+            "work",
+        ]);
+        let home = fork_home(&fixture, "work");
+        assert_eq!(output.trim(), format!("fake {}", home.display()));
+    }
+
+    #[test]
+    fn fork_shell_starts_the_users_shell_in_the_fork() {
+        let fixture = fork_fixture();
+        fixture.ok(&["fork", "create", "work", "--account", "b"]);
+        let mut child = fixture
+            .command(&["fork", "shell", "work"])
+            .env("SHELL", "/bin/sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"echo $CODEX_HOME\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            fork_home(&fixture, "work").to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn fork_names_cannot_escape_the_homes_directory() {
+        let fixture = fork_fixture();
+        for name in ["../escape", ".hidden", "a/b", ""] {
+            let output = fixture.run(&["fork", "create", name, "--account", "b"]);
+            assert!(!output.status.success(), "{name}");
+        }
+        assert!(!fixture.storage().directory.join("escape").exists());
+        let output = fixture.run(&["fork", "remove", "../../codex", "--yes"]);
+        assert!(!output.status.success());
+        assert!(fixture.storage().codex_home.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn empty_codex_home_falls_back_to_the_default_directory() {
+    let fixture = Fixture::new();
+    fixture.key("key", "sk-default");
+    let output = Command::new(env!("CARGO_BIN_EXE_codex-switcher"))
+        .env("HOME", fixture.0.path())
+        .env("CODEX_HOME", "")
+        .current_dir(fixture.0.path())
+        .args(["--no-restart", "--store-dir"])
+        .arg(fixture.storage().directory)
+        .args(["switch", "key"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.0.path().join(".codex/auth.json").exists());
+    assert!(!fixture.0.path().join("auth.json").exists());
+}

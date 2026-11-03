@@ -3,6 +3,7 @@ pub mod accounts;
 pub mod app_server;
 pub mod auth;
 pub mod config;
+pub mod fork;
 pub mod output;
 pub mod processes;
 pub mod status;

@@ -1,5 +1,6 @@
 //! Explicit inspection and graceful shutdown of local Codex and ChatGPT processes.
 
+use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -93,8 +94,15 @@ impl RunningProcess {
     }
 }
 
-/// Return active Codex CLI, Codex desktop, app-server, and ChatGPT processes.
-pub fn list_running() -> Result<Vec<RunningProcess>> {
+/// Return active Codex CLI, Codex desktop, app-server, and ChatGPT processes
+/// that belong to `codex_home`.
+pub fn list_running(codex_home: &Path) -> Result<Vec<RunningProcess>> {
+    let mut processes = list_all_processes()?;
+    processes.retain(|process| uses_home(process.pid, codex_home));
+    Ok(processes)
+}
+
+fn list_all_processes() -> Result<Vec<RunningProcess>> {
     #[cfg(unix)]
     {
         return list_unix_processes();
@@ -109,10 +117,70 @@ pub fn list_running() -> Result<Vec<RunningProcess>> {
     Ok(Vec::new())
 }
 
+/// Whether a process runs against `codex_home`. Only Linux can read another
+/// process's environment here, so other platforms treat every process as a match.
+#[cfg(target_os = "linux")]
+fn uses_home(pid: u32, codex_home: &Path) -> bool {
+    let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    match codex_home_from_environ(&environ).or_else(|| dirs::home_dir().map(|h| h.join(".codex"))) {
+        Some(home) => crate::storage::same_path(&home, codex_home),
+        None => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn uses_home(_pid: u32, _codex_home: &Path) -> bool {
+    true
+}
+
+/// Mirrors `Storage::new`: an empty CODEX_HOME means the default directory.
+#[cfg(target_os = "linux")]
+fn codex_home_from_environ(environ: &[u8]) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(b"CODEX_HOME="))
+        .filter(|value| !value.is_empty())
+        .map(|value| std::ffi::OsStr::from_bytes(value).into())
+}
+
+/// Whether a command runs codex-switcher itself. Compares file names, because
+/// a fork's Codex binary lives under a `.codex-switcher` directory.
+fn runs_switcher(command: &str) -> bool {
+    command.split_whitespace().any(|token| {
+        let name = token
+            .trim_matches('"')
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        name == "codex-switcher" || name == "codex-switcher.exe"
+    })
+}
+
+/// Stop the managed daemon's auto-updaters, which outlive `daemon stop`.
+pub fn stop_updaters(codex_home: &Path) -> Result<()> {
+    let updaters: Vec<_> = list_running(codex_home)?
+        .into_iter()
+        .filter(|process| process.kind == ProcessKind::CodexAppServerUpdater)
+        .collect();
+    for process in &updaters {
+        request_close(process);
+    }
+    wait_for_exit(&updaters, Duration::from_secs(8));
+    anyhow::ensure!(
+        !updaters.iter().any(|process| process_exists(process.pid)),
+        "The app-server updater is still running after a shutdown request"
+    );
+    Ok(())
+}
+
 /// Gracefully close the reviewed process list. New processes are left alone and
 /// cause the operation to stop so the user can review them first. Managed
 /// daemon processes are skipped: stop those with `codex app-server daemon stop`.
-pub fn stop(targets: &[RunningProcess]) -> Result<Vec<u32>> {
+pub fn stop(targets: &[RunningProcess], codex_home: &Path) -> Result<Vec<u32>> {
     let signalled = |process: &RunningProcess| process.kind.is_closable() && !process.managed;
     let targets: Vec<_> = targets
         .iter()
@@ -122,7 +190,10 @@ pub fn stop(targets: &[RunningProcess]) -> Result<Vec<u32>> {
         return Ok(Vec::new());
     }
 
-    let current: Vec<_> = list_running()?.into_iter().filter(signalled).collect();
+    let current: Vec<_> = list_running(codex_home)?
+        .into_iter()
+        .filter(signalled)
+        .collect();
     let reviewed: std::collections::HashMap<_, _> = targets
         .iter()
         .map(|process| (process.pid, *process))
@@ -170,8 +241,8 @@ pub fn stop(targets: &[RunningProcess]) -> Result<Vec<u32>> {
 
 /// Terminate app-server server processes that clients spawned themselves,
 /// leaving clients (`app-server proxy`), other subcommands, code-mode helpers,
-/// and the managed daemon (under `app-server-daemon/`) alone.
-pub fn stop_standalone_app_servers() -> Result<Vec<u32>> {
+/// the managed daemon (under `app-server-daemon/`), and other Codex homes alone.
+pub fn stop_standalone_app_servers(codex_home: &Path) -> Result<Vec<u32>> {
     #[cfg(unix)]
     {
         let output = Command::new("ps")
@@ -189,6 +260,7 @@ pub fn stop_standalone_app_servers() -> Result<Vec<u32>> {
             .filter(|process| {
                 is_app_server_daemon_process(&process.command)
                     && !process.command.contains("app-server-daemon")
+                    && uses_home(process.pid, codex_home)
             })
             .map(|process| RunningProcess::new(process.pid, ProcessKind::CodexAppServer))
             .collect();
@@ -218,7 +290,7 @@ pub fn stop_standalone_app_servers() -> Result<Vec<u32>> {
 /// `... app-server [--flags]` is a server; `app-server <subcommand>` is not.
 #[cfg(unix)]
 fn is_app_server_daemon_process(command: &str) -> bool {
-    if command.contains("codex-switcher") {
+    if runs_switcher(command) {
         return false;
     }
     let mut tokens = command
@@ -295,7 +367,7 @@ fn take_field(input: &str) -> Option<(&str, &str)> {
 fn classify_unix_process(process: UnixProcess) -> Option<RunningProcess> {
     let lower_name = process.name.to_ascii_lowercase();
     let lower_command = process.command.to_ascii_lowercase();
-    if lower_command.contains("codex-switcher") || lower_command.contains("--type=") {
+    if runs_switcher(&lower_command) || lower_command.contains("--type=") {
         return None;
     }
 
@@ -499,7 +571,7 @@ fn classify_windows_processes(entries: &[WindowsProcess]) -> Vec<RunningProcess>
             .executable_path
             .replace('/', "\\")
             .to_ascii_lowercase();
-        if command.contains("--type=") || command.contains("codex-switcher") {
+        if command.contains("--type=") || runs_switcher(&command) {
             continue;
         }
         if name == "codex-code-mode-host.exe"
@@ -641,8 +713,9 @@ fn process_exists(pid: u32) -> bool {
             .args(["-p", &pid.to_string(), "-o", "pid="])
             .output()
             .map(|output| {
+                // `ps -p` exits non-zero, silently, when the process is gone.
                 if !output.status.success() {
-                    return true;
+                    return !output.stderr.is_empty();
                 }
                 String::from_utf8_lossy(&output.stdout)
                     .split_whitespace()
@@ -660,8 +733,9 @@ fn process_exists(pid: u32) -> bool {
             .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
             .output()
             .map(|output| {
+                // `ps -p` exits non-zero, silently, when the process is gone.
                 if !output.status.success() {
-                    return true;
+                    return !output.stderr.is_empty();
                 }
                 String::from_utf8_lossy(&output.stdout).lines().any(|line| {
                     line.split(',')
@@ -686,7 +760,39 @@ fn wait_for_exit(processes: &[RunningProcess], timeout: Duration) {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{classify_unix_process, parse_unix_process_line, ProcessKind, UnixProcess};
+    #[test]
+    fn a_process_that_has_exited_no_longer_exists() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        assert!(super::process_exists(std::process::id()));
+        child.wait().unwrap();
+        assert!(!super::process_exists(pid));
+    }
+
+    #[test]
+    fn switcher_is_matched_by_file_name_not_by_its_directory() {
+        assert!(runs_switcher("/usr/bin/codex-switcher ps"));
+        assert!(runs_switcher("zsh -c codex-switcher stop"));
+        assert!(!runs_switcher(
+            "/home/u/.codex-switcher/homes/work/packages/app-server-daemon/current/bin/codex app-server"
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reads_codex_home_from_a_process_environment() {
+        use super::codex_home_from_environ;
+        assert_eq!(
+            codex_home_from_environ(b"A=1\0CODEX_HOME=/fork\0B=2\0"),
+            Some("/fork".into())
+        );
+        assert_eq!(codex_home_from_environ(b"A=1\0CODEX_HOME=\0"), None);
+        assert_eq!(codex_home_from_environ(b"NOT_CODEX_HOME=/x\0"), None);
+    }
+
+    use super::{
+        classify_unix_process, parse_unix_process_line, runs_switcher, ProcessKind, UnixProcess,
+    };
 
     #[cfg(unix)]
     #[test]

@@ -1,10 +1,9 @@
-use crate::types::{parse_chatgpt_id_token_claims, AccountsStore, AuthData, AuthDotJson};
+use crate::types::{
+    parse_chatgpt_id_token_claims, AccountsStore, AuthData, AuthDotJson, StoredAccount,
+};
 
 pub fn sync_active_account_tokens(store: &mut AccountsStore, auth: &AuthDotJson) -> bool {
     let Some(active_id) = store.active_account_id.as_deref() else {
-        return false;
-    };
-    let Some(tokens) = auth.tokens.as_ref() else {
         return false;
     };
     let Some(account) = store
@@ -12,6 +11,14 @@ pub fn sync_active_account_tokens(store: &mut AccountsStore, auth: &AuthDotJson)
         .iter_mut()
         .find(|account| account.id == active_id)
     else {
+        return false;
+    };
+    sync_account_tokens(account, auth)
+}
+
+/// Copy live tokens into a saved account, but only when both have the same identity.
+pub fn sync_account_tokens(account: &mut StoredAccount, auth: &AuthDotJson) -> bool {
+    let Some(tokens) = auth.tokens.as_ref() else {
         return false;
     };
     let AuthData::ChatGPT {

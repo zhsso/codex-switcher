@@ -148,6 +148,37 @@ codex-switcher warmup --json               # 输出每个账号的处理结果
 
 支持与 `status` 相同的 `--base-url <URL>`（默认 `https://chatgpt.com/backend-api`）。默认预热路径为 `/backend-api/codex/responses`，自定义后端不含 `/backend-api` 时为 `/api/codex/responses`；后端会接收账号认证信息。用量查询复用现有 token 刷新机制，预热读取刷新后的凭据；预热请求本身失败时不自动重试。
 
+## 多账号同时运行（fork，仅 Linux）
+
+`fork` 创建一个独立的 `CODEX_HOME`，让不同账号的 CLI 和 app-server daemon 同时运行：
+
+```sh
+codex-switcher fork create work --account so
+codex-switcher fork run work                     # 在 fork 中运行 codex
+codex-switcher fork run work codex resume --last # 运行指定命令，参数原样传递
+
+# 进入带 CODEX_HOME 的子 shell，其中的命令都使用这个 fork；exit 退出
+codex-switcher fork shell work
+
+# 在 fork 中换账号，只重启这个 fork 的 app-server
+codex-switcher fork run work codex-switcher switch other
+
+codex-switcher fork path work         # 输出目录，可用于 export CODEX_HOME=...
+codex-switcher fork list              # 查看每个 fork 使用的账号
+codex-switcher fork remove work       # 停止其 daemon 并删除，包括其中的会话；-y/--yes 跳过确认
+```
+
+fork 位于 `<账号库>/homes/<名称>`，从当前 Codex 目录创建：
+
+- **独立：** `auth.json`、sqlite 状态、会话、历史和日志。主目录的历史会话在 fork 中不可见。
+- **复制：** `config.toml`，并开启 `daemon_auto_start`。之后对原文件的修改不会同步。
+- **共享（符号链接）：** `skills`、`plugins`、`vendor_imports`、`rules`、`prompts`、`agents`、`AGENTS.md`、`AGENTS.override.md`。
+- **daemon：** 首次启动时由 Codex 把自己安装到 fork 的 `packages` 中（当前版本约 436 MB），不与其他目录共享。
+
+OAuth refresh token 会轮换，同一账号在两个目录同时使用会互相顶掉登录，因此已被其他目录使用的账号无法 `switch` 或 `fork create`，不带参数的 `switch` 也会跳过它们；API key 账号不受限制。账号命令会从所有 fork 及其来源目录收集轮换后的 token，刷新后也会写回正在使用该账号的目录。不要在 fork 里用 `codex login` 登录已在别处使用的账号，这一点无法拦截。
+
+在 Linux 上，`ps`、`stop` 和 `switch` 的重启只处理当前 Codex 目录的进程（读取 `/proc/<pid>/environ` 中的 `CODEX_HOME`）。
+
 ## 数据与切换
 
 - 默认沿用原应用的 `~/.codex-switcher/accounts.json`，已有账号无需迁移。旧界面配置与监控缓存不再使用，也不会删除用户目录中的文件。
