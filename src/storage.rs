@@ -27,9 +27,16 @@ impl Storage {
                     .map(PathBuf::from)
             }) {
                 Some(path) => path,
-                None => home()?.join(".codex"),
+                None => Self::default_codex_home()?,
             },
         })
+    }
+
+    /// Codex's own default directory, regardless of CODEX_HOME.
+    pub fn default_codex_home() -> Result<PathBuf> {
+        Ok(dirs::home_dir()
+            .context("Could not find home directory")?
+            .join(".codex"))
     }
 
     /// The same account store, operating on a different Codex home.

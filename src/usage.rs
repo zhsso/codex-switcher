@@ -484,9 +484,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn refreshed_tokens_reach_the_fork_using_the_account() {
+    async fn refreshed_tokens_reach_the_workspace_using_the_account() {
         let (_dir, storage, account) = setup();
-        let (fork, _) = crate::fork::create(&storage, "work", &account.id)
+        let (home, _) = crate::workspace::create(&storage, "work", Some(&account.id))
             .await
             .unwrap();
         let refreshed =
@@ -498,7 +498,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows[0].status, "ok");
         server.join().unwrap();
-        let auth = storage.with_home(fork).read_auth().unwrap().unwrap();
+        let auth = storage.with_home(home).read_auth().unwrap().unwrap();
         assert_eq!(auth.tokens.unwrap().refresh_token, "new-refresh");
         assert!(!storage.auth_path().exists());
     }

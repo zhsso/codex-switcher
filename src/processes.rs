@@ -147,7 +147,7 @@ fn codex_home_from_environ(environ: &[u8]) -> Option<std::path::PathBuf> {
 }
 
 /// Whether a command runs codex-switcher itself. Compares file names, because
-/// a fork's Codex binary lives under a `.codex-switcher` directory.
+/// a workspace's Codex binary lives under a `.codex-switcher` directory.
 fn runs_switcher(command: &str) -> bool {
     command.split_whitespace().any(|token| {
         let name = token
@@ -774,7 +774,7 @@ mod tests {
         assert!(runs_switcher("/usr/bin/codex-switcher ps"));
         assert!(runs_switcher("zsh -c codex-switcher stop"));
         assert!(!runs_switcher(
-            "/home/u/.codex-switcher/homes/work/packages/app-server-daemon/current/bin/codex app-server"
+            "/home/u/.codex-switcher/workspaces/work/packages/app-server-daemon/current/bin/codex app-server"
         ));
     }
 
@@ -783,8 +783,8 @@ mod tests {
     fn reads_codex_home_from_a_process_environment() {
         use super::codex_home_from_environ;
         assert_eq!(
-            codex_home_from_environ(b"A=1\0CODEX_HOME=/fork\0B=2\0"),
-            Some("/fork".into())
+            codex_home_from_environ(b"A=1\0CODEX_HOME=/workspace\0B=2\0"),
+            Some("/workspace".into())
         );
         assert_eq!(codex_home_from_environ(b"A=1\0CODEX_HOME=\0"), None);
         assert_eq!(codex_home_from_environ(b"NOT_CODEX_HOME=/x\0"), None);

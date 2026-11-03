@@ -6,11 +6,11 @@ use crate::auth::{
     refresh::refresh_if_needed,
     sync::{sync_account_tokens, sync_active_account_tokens},
 };
-use crate::fork;
 use crate::storage::Storage;
 use crate::types::{
     parse_chatgpt_id_token_claims, AccountsStore, AuthData, AuthDotJson, StoredAccount,
 };
+use crate::workspace;
 
 /// Resolve exact IDs first, then exact names. Never guess between ambiguous names.
 pub fn resolve(store: &AccountsStore, selector: &str) -> Result<usize> {
@@ -109,7 +109,7 @@ pub fn account_for_auth<'a>(
 
 /// Other Codex homes currently logged in to this account.
 pub fn peer_homes_using(storage: &Storage, account: &StoredAccount) -> Vec<PathBuf> {
-    fork::peer_auths(storage)
+    workspace::peer_auths(storage)
         .into_iter()
         .filter(|(_, auth)| matches_auth(account, auth))
         .map(|(home, _)| home)
@@ -131,7 +131,7 @@ fn holder<'a>(account: &StoredAccount, peers: &'a [(PathBuf, AuthDotJson)]) -> O
 /// known home. The current home goes last: its auth.json wins any conflict.
 pub fn load_current(storage: &Storage) -> Result<AccountsStore> {
     let mut store = storage.load()?;
-    for (_, auth) in fork::peer_auths(storage) {
+    for (_, auth) in workspace::peer_auths(storage) {
         let Some(id) = account_for_auth(&store, &auth).map(|account| account.id.clone()) else {
             continue;
         };
@@ -228,15 +228,15 @@ pub async fn switch_next(storage: &Storage) -> Result<String> {
 async fn switch_target(storage: &Storage, selector: Option<&str>) -> Result<String> {
     let _lock = storage.lock()?;
     let mut store = load_current(storage)?;
-    let peers = fork::peer_auths(storage);
+    let peers = workspace::peer_auths(storage);
     let index = match selector {
         Some(selector) => {
             let index = resolve(&store, selector)?;
             if let Some(home) = holder(&store.accounts[index], &peers) {
                 anyhow::bail!(
-                    "Account '{}' is already in use by Codex home {}; using it in two homes would invalidate its login",
+                    "Account '{}' is already in use by {}; switch that to another account first, because using it in two places would invalidate its login",
                     store.accounts[index].name,
-                    home.display()
+                    workspace::describe(storage, home)
                 );
             }
             index
@@ -255,7 +255,7 @@ async fn switch_target(storage: &Storage, selector: Option<&str>) -> Result<Stri
             (0..count)
                 .map(|offset| (start + offset) % count)
                 .find(|&index| holder(&store.accounts[index], &peers).is_none())
-                .context("Every saved account is in use by another Codex home")?
+                .context("Every saved account is in use by another workspace")?
         }
     };
     // Preserve live rotated tokens before any network request or auth.json write.

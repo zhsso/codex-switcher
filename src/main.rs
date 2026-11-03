@@ -5,8 +5,8 @@ use std::sync::atomic::Ordering;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use codex_switcher::{
-    accounts, app_server, auth, fork, processes, status, storage::Storage, types::StoredAccount,
-    usage, warmup,
+    accounts, app_server, auth, processes, status, storage::Storage, types::StoredAccount, usage,
+    warmup, workspace,
 };
 
 #[derive(Parser)]
@@ -25,6 +25,9 @@ struct Cli {
     /// Codex directory (default: CODEX_HOME or ~/.codex)
     #[arg(long, global = true)]
     codex_home: Option<PathBuf>,
+    /// Workspace to operate on instead of the current Codex directory
+    #[arg(short, long, global = true, conflicts_with = "codex_home")]
+    workspace: Option<String>,
     /// Codex executable used to control the app-server daemon
     #[arg(long, global = true, default_value = "codex")]
     codex_bin: String,
@@ -244,66 +247,68 @@ Examples:
         #[arg(short, long)]
         yes: bool,
     },
-    /// Create isolated Codex homes so accounts can run at the same time
+    /// Manage workspaces, so several accounts can run at the same time
     #[command(
-        after_help = r#"A fork is a separate CODEX_HOME logged in to its own account, with its own
-sessions, state, and app-server daemon. Skills and plugins are shared with the
-home it was forked from; config.toml is copied. An account can only be in use by
-one home at a time. Linux only.
+        after_help = r#"A workspace is a Codex directory with its own login, sessions, state, and
+app-server daemon. ~/.codex is the workspace named default. New workspaces copy
+config.toml from the current Codex directory and share its skills and plugins.
+Add -w NAME to any command to run it against a workspace. An OAuth account can
+only be used by one workspace at a time. Linux only.
 
 Examples:
-  codex-switcher fork create work --account so
-  codex-switcher fork run work
-  codex-switcher fork run work codex resume --last
-  codex-switcher fork run work codex-switcher switch other
-  codex-switcher fork shell work
-  codex-switcher fork list
-  codex-switcher fork remove work"#
+  codex-switcher workspace create work
+  codex-switcher switch so -w work
+  codex-switcher workspace run work
+  codex-switcher workspace run work codex resume --last
+  codex-switcher workspace shell work
+  codex-switcher -w work status
+  codex-switcher workspace list
+  codex-switcher workspace remove work"#
     )]
-    Fork {
+    Workspace {
         #[command(subcommand)]
-        command: ForkCommand,
+        command: WorkspaceCommand,
     },
 }
 
 #[derive(Subcommand)]
-enum ForkCommand {
-    /// Create a fork of the current Codex home, logged in to a saved account
+enum WorkspaceCommand {
+    /// Create a workspace from the current Codex directory
     Create {
-        /// Fork name: letters, digits, '.', '_' or '-'
+        /// Workspace name: letters, digits, '.', '_' or '-'
         name: String,
-        /// Exact account name or full ID; must not be in use by another home
+        /// Also switch it to this saved account (exact name or full ID)
         #[arg(long)]
-        account: String,
+        account: Option<String>,
     },
-    /// List forks and the account each one is using
+    /// List workspaces and the account each one is using
     #[command(visible_alias = "ls")]
     List {
         /// Print machine-readable JSON instead of formatted text
         #[arg(long)]
         json: bool,
     },
-    /// Run a command with CODEX_HOME set to a fork (default: codex)
+    /// Run a command with CODEX_HOME set to a workspace (default: codex)
     Run {
-        /// Fork name
+        /// Workspace name
         name: String,
         /// Command and arguments to run instead of codex
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
-    /// Start a shell with CODEX_HOME set to a fork; `exit` leaves it
+    /// Start a shell with CODEX_HOME set to a workspace; `exit` leaves it
     Shell {
-        /// Fork name
+        /// Workspace name
         name: String,
     },
-    /// Print a fork's directory, for use as CODEX_HOME
+    /// Print a workspace's directory, for use as CODEX_HOME
     Path {
-        /// Fork name
+        /// Workspace name
         name: String,
     },
-    /// Stop a fork's app-server daemon and delete the fork, including its sessions
+    /// Stop a workspace's app-server daemon and delete it, including its sessions
     Remove {
-        /// Fork name
+        /// Workspace name
         name: String,
         /// Delete without prompting for confirmation
         #[arg(short, long)]
@@ -383,6 +388,21 @@ fn import(storage: &Storage, source: &Source, name: String) -> Result<StoredAcco
     auth::credentials::import_from_auth_json_contents(&contents, name)
 }
 
+fn open_storage(
+    store_dir: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+    workspace: Option<&str>,
+) -> Result<Storage> {
+    let storage = Storage::new(store_dir, codex_home)?;
+    Ok(match workspace {
+        Some(name) => {
+            let home = workspace::resolve(&storage.directory, name)?;
+            storage.with_home(home)
+        }
+        None => storage,
+    })
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run(Cli::parse()).await {
@@ -403,7 +423,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         },
     };
-    let storage = Storage::new(cli.store_dir, cli.codex_home)?;
+    let storage = open_storage(cli.store_dir, cli.codex_home, cli.workspace.as_deref())?;
     match cli.command {
         Command::Add {
             name,
@@ -580,33 +600,38 @@ async fn run(cli: Cli) -> Result<()> {
             closed += processes::stop(&running, &storage.codex_home)?.len();
             println!("Closed {closed} process(es).");
         }
-        Command::Fork { command } => match command {
-            ForkCommand::Create { name, account } => {
-                let (_, account) = fork::create(&storage, &name, &account).await?;
-                println!("Created fork {name} using {account}");
-                println!("Run: codex-switcher fork run {name}");
+        Command::Workspace { command } => match command {
+            WorkspaceCommand::Create { name, account } => {
+                let (_, account) = workspace::create(&storage, &name, account.as_deref()).await?;
+                match account {
+                    Some(account) => println!("Created workspace {name} using {account}"),
+                    None => {
+                        println!("Created workspace {name}");
+                        println!("Choose an account: codex-switcher switch ACCOUNT -w {name}");
+                    }
+                }
+                println!("Run: codex-switcher workspace run {name}");
             }
-            ForkCommand::List { json } => {
-                let forks = fork::list(&storage)?;
+            WorkspaceCommand::List { json } => {
+                let workspaces = workspace::list(&storage)?;
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&forks)?);
-                } else if forks.is_empty() {
-                    println!("No forks.");
+                    println!("{}", serde_json::to_string_pretty(&workspaces)?);
                 } else {
-                    for fork in forks {
+                    for workspace in workspaces {
                         println!(
-                            "{}  {}  {}",
-                            fork.name,
-                            fork.account.as_deref().unwrap_or("(no saved account)"),
-                            fork.path.display()
+                            "{} {}  {}  {}",
+                            if workspace.current { "*" } else { " " },
+                            workspace.name,
+                            workspace.account.as_deref().unwrap_or("(no saved account)"),
+                            workspace.path.display()
                         );
                     }
                 }
             }
-            ForkCommand::Run { name, command } => {
-                let path = fork::path(&storage, &name)?;
+            WorkspaceCommand::Run { name, command } => {
+                let path = workspace::path(&storage, &name)?;
                 match command.split_first() {
-                    Some((program, args)) => fork::exec(&path, program.as_ref(), args)?,
+                    Some((program, args)) => workspace::exec(&path, program.as_ref(), args)?,
                     None => {
                         let codex = app_server::resolve_codex_bin(&cli.codex_bin, &path)
                             .with_context(|| {
@@ -615,27 +640,27 @@ async fn run(cli: Cli) -> Result<()> {
                                     cli.codex_bin
                                 )
                             })?;
-                        fork::exec(&path, codex.as_os_str(), &[])?
+                        workspace::exec(&path, codex.as_os_str(), &[])?
                     }
                 }
             }
-            ForkCommand::Shell { name } => {
-                let path = fork::path(&storage, &name)?;
+            WorkspaceCommand::Shell { name } => {
+                let path = workspace::path(&storage, &name)?;
                 let shell = std::env::var_os("SHELL")
                     .filter(|shell| !shell.is_empty())
                     .unwrap_or_else(|| "/bin/sh".into());
-                eprintln!("Using fork {name}; type `exit` to leave");
-                fork::exec(&path, &shell, &[])?
+                eprintln!("Using workspace {name}; type `exit` to leave");
+                workspace::exec(&path, &shell, &[])?
             }
-            ForkCommand::Path { name } => {
-                println!("{}", fork::path(&storage, &name)?.display());
+            WorkspaceCommand::Path { name } => {
+                println!("{}", workspace::path(&storage, &name)?.display());
             }
-            ForkCommand::Remove { name, yes } => {
-                let path = fork::path(&storage, &name)?;
+            WorkspaceCommand::Remove { name, yes } => {
+                let path = workspace::path(&storage, &name)?;
                 if !yes {
                     anyhow::ensure!(
                         io::stdin().is_terminal(),
-                        "confirmation requires a terminal; use `fork remove --yes` to proceed"
+                        "confirmation requires a terminal; use `workspace remove --yes` to proceed"
                     );
                     eprint!(
                         "Delete {} including its sessions and history? [y/N] ",
@@ -649,8 +674,8 @@ async fn run(cli: Cli) -> Result<()> {
                         return Ok(());
                     }
                 }
-                fork::remove(&storage, &name, &cli.codex_bin)?;
-                println!("Removed fork {name}");
+                workspace::remove(&storage, &name, &cli.codex_bin)?;
+                println!("Removed workspace {name}");
             }
         },
     }

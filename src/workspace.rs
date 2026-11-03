@@ -1,8 +1,9 @@
-//! Isolated Codex homes, so several accounts can run at the same time.
+//! Workspaces: Codex homes that can each run their own account at the same time.
 //!
-//! A fork lives in `<store>/homes/<name>` and keeps its own credentials, state,
-//! and managed daemon. Nothing records which account a fork uses: its auth.json
-//! is the source of truth, including after `switch` or `codex login` inside it.
+//! `~/.codex` is the workspace named `default`. Every other workspace lives in
+//! `<store>/workspaces/<name>` and keeps its own credentials, state, and managed
+//! daemon. Nothing records which account a workspace uses: its auth.json is the
+//! source of truth, including after `switch` or `codex login` inside it.
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +17,8 @@ use crate::storage::{same_path, Storage};
 use crate::types::AuthDotJson;
 use crate::{accounts, app_server, config, processes};
 
-const MARKER: &str = ".codex-switcher-fork.json";
+const MARKER: &str = ".codex-switcher-workspace.json";
+pub const DEFAULT: &str = "default";
 
 /// Read-mostly customizations that should stay the same in every home. Packages
 /// are not shared: each daemon installs and updates its own copy.
@@ -38,27 +40,27 @@ struct Marker {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ForkInfo {
+pub struct WorkspaceInfo {
     pub name: String,
     pub account: Option<String>,
     pub path: PathBuf,
-    pub source: PathBuf,
+    pub current: bool,
 }
 
 fn root(storage: &Storage) -> PathBuf {
-    storage.directory.join("homes")
+    storage.directory.join("workspaces")
 }
 
 fn read_marker(directory: &Path) -> Option<Marker> {
     serde_json::from_slice(&fs::read(directory.join(MARKER)).ok()?).ok()
 }
 
-/// Every fork, sorted by name. A directory without a marker is not a fork.
-fn forks(storage: &Storage) -> Vec<(String, PathBuf, Marker)> {
+/// Every workspace, sorted by name. A directory without a marker is not a workspace.
+fn workspaces(storage: &Storage) -> Vec<(String, PathBuf, Marker)> {
     let Ok(entries) = fs::read_dir(root(storage)) else {
         return Vec::new();
     };
-    let mut forks: Vec<_> = entries
+    let mut workspaces: Vec<_> = entries
         .flatten()
         .filter_map(|entry| {
             let marker = read_marker(&entry.path())?;
@@ -69,16 +71,16 @@ fn forks(storage: &Storage) -> Vec<(String, PathBuf, Marker)> {
             ))
         })
         .collect();
-    forks.sort_by(|left, right| left.0.cmp(&right.0));
-    forks
+    workspaces.sort_by(|left, right| left.0.cmp(&right.0));
+    workspaces
 }
 
-/// The login of every known home other than the current one: all forks and the
-/// homes they came from. Unreadable files are skipped, because a broken fork
+/// The login of every known home other than the current one: all workspaces and the
+/// homes they came from. Unreadable files are skipped, because a broken workspace
 /// must not stop accounts from working everywhere else.
 pub fn peer_auths(storage: &Storage) -> Vec<(PathBuf, AuthDotJson)> {
     let mut homes: Vec<PathBuf> = Vec::new();
-    for (_, path, marker) in forks(storage) {
+    for (_, path, marker) in workspaces(storage) {
         for home in [path, marker.source] {
             if !same_path(&home, &storage.codex_home)
                 && !homes.iter().any(|known| same_path(known, &home))
@@ -103,23 +105,46 @@ fn validate_name(name: &str) -> Result<()> {
             && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
-        "Fork name '{name}' must use letters, digits, '.', '_' or '-' and not start with '.'"
+        "Workspace name '{name}' must use letters, digits, '.', '_' or '-' and not start with '.'"
     );
     Ok(())
 }
 
-/// The directory of an existing fork.
+/// The directory of an existing workspace.
 pub fn path(storage: &Storage, name: &str) -> Result<PathBuf> {
+    resolve(&storage.directory, name)
+}
+
+/// The directory of an existing workspace in the account store at `directory`.
+pub fn resolve(directory: &Path, name: &str) -> Result<PathBuf> {
+    if name == DEFAULT {
+        return Storage::default_codex_home();
+    }
     validate_name(name)?;
-    let path = std::path::absolute(root(storage).join(name))?;
+    let path = std::path::absolute(directory.join("workspaces").join(name))?;
     anyhow::ensure!(
         read_marker(&path).is_some(),
-        "Fork '{name}' not found; use `codex-switcher fork list` to see forks"
+        "Workspace '{name}' not found; use `codex-switcher workspace list` to see workspaces"
     );
     Ok(path)
 }
 
-/// Replace this process with `program`, running against the fork at `path`, so
+/// How to refer to a Codex home in messages.
+pub fn describe(storage: &Storage, home: &Path) -> String {
+    let default = Storage::default_codex_home().is_ok_and(|path| same_path(&path, home));
+    if default {
+        return format!("workspace '{DEFAULT}'");
+    }
+    workspaces(storage)
+        .into_iter()
+        .find(|(_, path, _)| same_path(path, home))
+        .map_or_else(
+            || format!("Codex home {}", home.display()),
+            |(name, _, _)| format!("workspace '{name}'"),
+        )
+}
+
+/// Replace this process with `program`, running against the workspace at `path`, so
 /// the terminal, signals, and exit code all belong to that program.
 pub fn exec(path: &Path, program: &OsStr, args: &[String]) -> Result<()> {
     let mut command = Command::new(program);
@@ -137,19 +162,24 @@ pub fn exec(path: &Path, program: &OsStr, args: &[String]) -> Result<()> {
     }
 }
 
-pub fn list(storage: &Storage) -> Result<Vec<ForkInfo>> {
+/// The default workspace first, then the others by name.
+pub fn list(storage: &Storage) -> Result<Vec<WorkspaceInfo>> {
     let store = storage.load()?;
-    Ok(forks(storage)
+    let default = (DEFAULT.to_owned(), Storage::default_codex_home()?);
+    let others = workspaces(storage)
         .into_iter()
-        .map(|(name, path, marker)| {
+        .map(|(name, path, _)| (name, path));
+    Ok(std::iter::once(default)
+        .chain(others)
+        .map(|(name, path)| {
             let auth = storage.with_home(path.clone()).read_auth().ok().flatten();
-            ForkInfo {
+            WorkspaceInfo {
                 name,
                 account: auth.as_ref().and_then(|auth| {
                     accounts::account_for_auth(&store, auth).map(|account| account.name.clone())
                 }),
+                current: same_path(&path, &storage.codex_home),
                 path,
-                source: marker.source,
             }
         })
         .collect())
@@ -166,7 +196,7 @@ fn populate(source: &Path, target: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("Failed to copy config.toml"),
     }
-    // Clients reach the fork's own daemon, which can then be restarted on a switch.
+    // Clients reach the workspace's own daemon, which a switch can then restart.
     config::ensure_daemon_auto_start(target)?;
     #[cfg(unix)]
     for entry in SHARED {
@@ -190,30 +220,41 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Fork the current Codex home. Returns the new directory and the account name.
-pub async fn create(storage: &Storage, name: &str, account: &str) -> Result<(PathBuf, String)> {
+/// Create a workspace from the current Codex home, optionally logged in to a
+/// saved account. Returns the new directory and the account's name.
+pub async fn create(
+    storage: &Storage,
+    name: &str,
+    account: Option<&str>,
+) -> Result<(PathBuf, Option<String>)> {
     anyhow::ensure!(
         cfg!(target_os = "linux"),
-        "Forks are only supported on Linux, where processes can be told apart by Codex home"
+        "Workspaces are only supported on Linux, where processes can be told apart by Codex home"
     );
     validate_name(name)?;
+    anyhow::ensure!(name != DEFAULT, "Workspace '{DEFAULT}' already exists");
     // Report an unknown account before touching the disk.
-    let store = accounts::load_current(storage)?;
-    accounts::resolve(&store, account)?;
+    if let Some(account) = account {
+        let store = accounts::load_current(storage)?;
+        accounts::resolve(&store, account)?;
+    }
 
     let root = std::path::absolute(root(storage))?;
     fs::create_dir_all(&root)?;
     let target = root.join(name);
     create_private_dir(&target).map_err(|error| match error.kind() {
-        std::io::ErrorKind::AlreadyExists => anyhow::anyhow!("Fork '{name}' already exists"),
+        std::io::ErrorKind::AlreadyExists => anyhow::anyhow!("Workspace '{name}' already exists"),
         _ => anyhow::Error::new(error).context(format!("Failed to create {}", target.display())),
     })?;
 
     let source = std::path::absolute(&storage.codex_home)?;
-    let fork_storage = storage.with_home(target.clone());
-    let result = match populate(&source, &target) {
-        Ok(()) => accounts::switch(&fork_storage, account).await,
-        Err(error) => Err(error),
+    let workspace_storage = storage.with_home(target.clone());
+    let result = match (populate(&source, &target), account) {
+        (Ok(()), Some(account)) => accounts::switch(&workspace_storage, account)
+            .await
+            .map(Some),
+        (Ok(()), None) => Ok(None),
+        (Err(error), _) => Err(error),
     };
     match result {
         Ok(account) => Ok((target, account)),
@@ -225,8 +266,9 @@ pub async fn create(storage: &Storage, name: &str, account: &str) -> Result<(Pat
     }
 }
 
-/// Stop the fork's daemon, save its rotated tokens, and delete it.
+/// Stop the workspace's daemon, save its rotated tokens, and delete it.
 pub fn remove(storage: &Storage, name: &str, codex_bin: &str) -> Result<()> {
+    anyhow::ensure!(name != DEFAULT, "Workspace '{DEFAULT}' cannot be removed");
     let path = path(storage, name)?;
     let running = processes::list_running(&path)?;
     let clients = running
@@ -235,7 +277,7 @@ pub fn remove(storage: &Storage, name: &str, codex_bin: &str) -> Result<()> {
         .count();
     anyhow::ensure!(
         clients == 0,
-        "{clients} process(es) are still using fork '{name}'; close them or run `CODEX_HOME={} codex-switcher stop`",
+        "{clients} process(es) are still using workspace '{name}'; close them or run `CODEX_HOME={} codex-switcher stop`",
         path.display()
     );
     if running
@@ -248,10 +290,10 @@ pub fn remove(storage: &Storage, name: &str, codex_bin: &str) -> Result<()> {
     let remaining = processes::list_running(&path)?.len();
     anyhow::ensure!(
         remaining == 0,
-        "{remaining} process(es) are still using fork '{name}'; try again shortly"
+        "{remaining} process(es) are still using workspace '{name}'; try again shortly"
     );
 
-    // Deleting the fork's auth.json must not lose the only valid refresh token.
+    // Deleting the workspace's auth.json must not lose the only valid refresh token.
     let _lock = storage.lock()?;
     let store = accounts::load_current(storage)?;
     storage.save(&store)?;
