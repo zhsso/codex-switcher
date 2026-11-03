@@ -19,15 +19,19 @@ impl Theme {
         }
     }
 
-    fn heading(&self, name: &str, active: bool) -> String {
+    /// Cyan marks the account of the current workspace; the tag names every
+    /// workspace logged in to the account.
+    fn heading(&self, name: &str, active: bool, workspaces: &[String]) -> String {
+        let color = if active { "96" } else { "37" };
         format!(
             "  {} {}{}",
-            self.paint("●", if active { "96" } else { "37" }),
+            self.paint("●", color),
             self.paint(&clean(name), "1;97"),
-            if active {
-                format!("  {}", self.paint("[current]", "96"))
-            } else {
+            if workspaces.is_empty() {
                 String::new()
+            } else {
+                let tag = format!("[{}]", clean(&workspaces.join(", ")));
+                format!("  {}", self.paint(&tag, color))
             }
         )
     }
@@ -46,7 +50,7 @@ impl Theme {
             let _ = writeln!(
                 out,
                 "\n{}\n    {}  {}",
-                self.heading(&row.name, false),
+                self.heading(&row.name, false, &[]),
                 self.paint(row.status, color),
                 clean(&row.message)
             );
@@ -75,6 +79,7 @@ impl Theme {
                         row.plan_type.as_deref().unwrap_or("unknown")
                     ),
                     row.is_active,
+                    &row.workspaces,
                 )
             );
             if let Some(error) = &row.error {
@@ -166,7 +171,11 @@ impl Theme {
             let _ = writeln!(
                 out,
                 "\n{}",
-                self.heading(row.name.as_deref().unwrap_or("-"), row.is_active)
+                self.heading(
+                    row.name.as_deref().unwrap_or("-"),
+                    row.is_active,
+                    &row.workspaces
+                )
             );
             let _ = writeln!(
                 out,

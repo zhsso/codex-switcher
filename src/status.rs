@@ -12,6 +12,8 @@ pub struct AccountStatus {
     pub plan_type: Option<String>,
     pub auth_mode: AuthMode,
     pub is_active: bool,
+    /// Workspaces logged in to this account.
+    pub workspaces: Vec<String>,
     pub credential_status: &'static str,
     pub id_token_expires_at: Option<DateTime<Utc>>,
     pub access_token_expires_at: Option<DateTime<Utc>>,
@@ -29,6 +31,7 @@ impl AccountStatus {
             plan_type: None,
             auth_mode: AuthMode::ApiKey,
             is_active: false,
+            workspaces: Vec::new(),
             credential_status: "missing",
             id_token_expires_at: None,
             access_token_expires_at: None,

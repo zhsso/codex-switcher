@@ -883,6 +883,123 @@ mod workspaces {
     }
 
     #[test]
+    fn account_lists_name_the_workspaces_using_each_account() {
+        let fixture = workspace_fixture();
+        fixture.ok(&["workspace", "create", "work", "--account", "b"]);
+        let file = fixture.0.path().join("auth/c");
+        fs::write(&file, oauth_auth("c", "c").to_string()).unwrap();
+        fixture.ok(&["add", "c", "--file", file.to_str().unwrap()]);
+
+        let text = fixture.ok(&["--color", "never", "list"]);
+        let line = |name: &str| {
+            text.lines()
+                .find(|line| line.contains(&format!("● {name}")))
+                .unwrap()
+                .to_owned()
+        };
+        assert!(line("a").ends_with("[current]"), "{text}");
+        assert!(line("b").ends_with("[work]"), "{text}");
+        assert!(!line("c").contains('['), "{text}");
+
+        let rows = fixture.list();
+        assert_eq!(rows[1]["workspaces"], json!(["work"]));
+        assert_eq!(rows[2]["workspaces"], json!([]));
+
+        let in_work = fixture.in_workspace(&["-w", "work", "--color", "never", "list"]);
+        let in_work = String::from_utf8_lossy(&in_work.stdout);
+        assert!(in_work.contains("[work]"), "{in_work}");
+    }
+
+    #[test]
+    fn disabling_frees_the_account_until_enable_or_switch() {
+        let fixture = workspace_fixture();
+        fixture.ok(&["workspace", "create", "work", "--account", "b"]);
+        let home = workspace_home(&fixture, "work");
+        // Tokens rotated while the workspace ran must survive being disabled.
+        fs::write(
+            home.join("auth.json"),
+            oauth_auth("b", "rotated").to_string(),
+        )
+        .unwrap();
+
+        let output = fixture.ok(&["workspace", "disable", "work"]);
+        assert!(output.contains("b is free"), "{output}");
+        assert!(!home.join("auth.json").exists());
+        assert!(!fixture
+            .run(&["workspace", "disable", "work"])
+            .status
+            .success());
+
+        let listed: Value =
+            serde_json::from_str(&fixture.ok(&["workspace", "list", "--json"])).unwrap();
+        assert_eq!(listed[1]["disabled"], true);
+        assert_eq!(listed[1]["disabled_account"], "b");
+
+        let refused = fixture.run(&["workspace", "run", "work"]);
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("is disabled"));
+
+        // Another home takes the account, so enable has to wait for it.
+        fixture.ok(&["switch", "b"]);
+        assert_eq!(fixture.auth()["tokens"]["refresh_token"], "refresh-rotated");
+        let refused = fixture.run(&["workspace", "enable", "work"]);
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("already in use"));
+        assert!(!home.join("auth.json").exists());
+
+        fixture.ok(&["switch", "a"]);
+        let output = fixture.ok(&["workspace", "enable", "work"]);
+        assert!(
+            output.contains("Enabled workspace work using b"),
+            "{output}"
+        );
+        let auth: Value =
+            serde_json::from_slice(&fs::read(home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth["tokens"]["refresh_token"], "refresh-rotated");
+        assert!(!fixture
+            .run(&["workspace", "enable", "work"])
+            .status
+            .success());
+    }
+
+    #[test]
+    fn switching_a_disabled_workspace_enables_it_with_the_chosen_account() {
+        let fixture = workspace_fixture();
+        let file = fixture.0.path().join("auth/c");
+        fs::write(&file, oauth_auth("c", "c").to_string()).unwrap();
+        fixture.ok(&["add", "c", "--file", file.to_str().unwrap()]);
+        fixture.ok(&["workspace", "create", "work", "--account", "b"]);
+        fixture.ok(&["workspace", "disable", "work"]);
+
+        let output = fixture.in_workspace(&["switch", "c", "-w", "work"]);
+        assert!(output.status.success());
+        let listed: Value =
+            serde_json::from_str(&fixture.ok(&["workspace", "list", "--json"])).unwrap();
+        assert_eq!(listed[1]["disabled"], false);
+        assert_eq!(listed[1]["account"], "c");
+        assert!(!fixture
+            .run(&["workspace", "enable", "work"])
+            .status
+            .success());
+    }
+
+    #[test]
+    fn disable_keeps_a_login_that_is_not_saved() {
+        let fixture = workspace_fixture();
+        fixture.ok(&["workspace", "create", "work"]);
+        let refused = fixture.run(&["workspace", "disable", "work"]);
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("not logged in"));
+
+        let home = workspace_home(&fixture, "work");
+        fs::write(
+            home.join("auth.json"),
+            oauth_auth("unsaved", "x").to_string(),
+        )
+        .unwrap();
+        let refused = fixture.run(&["workspace", "disable", "work"]);
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("not a saved account"));
+        assert!(home.join("auth.json").exists());
+    }
+
+    #[test]
     fn dot_codex_is_the_default_workspace() {
         let fixture = workspace_fixture();
         let path = fixture.ok(&["workspace", "path", "default"]);

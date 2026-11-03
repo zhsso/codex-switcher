@@ -263,6 +263,8 @@ Examples:
   codex-switcher workspace shell work
   codex-switcher -w work status
   codex-switcher workspace list
+  codex-switcher workspace disable work
+  codex-switcher workspace enable work
   codex-switcher workspace remove work"#
     )]
     Workspace {
@@ -287,6 +289,21 @@ enum WorkspaceCommand {
         /// Print machine-readable JSON instead of formatted text
         #[arg(long)]
         json: bool,
+    },
+    /// Stop a workspace's daemon and release its account for other workspaces
+    #[command(
+        after_help = r#"Tokens are saved and the workspace's auth.json is removed, so the account can
+be used elsewhere. Sessions and settings stay. Refuses while clients are running.
+`enable` restores the same account; `switch ACCOUNT -w NAME` picks any free one."#
+    )]
+    Disable {
+        /// Workspace name
+        name: String,
+    },
+    /// Log a disabled workspace back in to the account it released
+    Enable {
+        /// Workspace name
+        name: String,
     },
     /// Run a command with CODEX_HOME set to a workspace (default: codex)
     Run {
@@ -539,11 +556,13 @@ async fn run(cli: Cli) -> Result<()> {
         Command::List { json } => {
             let store = accounts::load_current(&storage)?;
             let now = chrono::Utc::now().timestamp();
+            let logins = workspace::logins(&storage);
             let rows: Vec<_> = store
                 .accounts
                 .iter()
-                .map(|account| {
-                    status::AccountStatus::from_stored(
+                .map(|account| status::AccountStatus {
+                    workspaces: accounts::workspaces_using(account, &logins),
+                    ..status::AccountStatus::from_stored(
                         account,
                         store.active_account_id.as_deref(),
                         now,
@@ -618,14 +637,36 @@ async fn run(cli: Cli) -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&workspaces)?);
                 } else {
                     for workspace in workspaces {
+                        let account = if workspace.disabled {
+                            match &workspace.disabled_account {
+                                Some(account) => format!("disabled ({account})"),
+                                None => "disabled".to_owned(),
+                            }
+                        } else {
+                            workspace
+                                .account
+                                .clone()
+                                .unwrap_or_else(|| "(no saved account)".to_owned())
+                        };
                         println!(
                             "{} {}  {}  {}",
                             if workspace.current { "*" } else { " " },
                             workspace.name,
-                            workspace.account.as_deref().unwrap_or("(no saved account)"),
+                            account,
                             workspace.path.display()
                         );
                     }
+                }
+            }
+            WorkspaceCommand::Disable { name } => {
+                let account = workspace::disable(&storage, &name, &cli.codex_bin)?;
+                println!("Disabled workspace {name}; {account} is free to use elsewhere");
+            }
+            WorkspaceCommand::Enable { name } => {
+                let (path, account) = workspace::enable(&storage, &name).await?;
+                println!("Enabled workspace {name} using {account}");
+                if !cli.no_restart {
+                    restart_home_app_servers(&path, &cli.codex_bin)?;
                 }
             }
             WorkspaceCommand::Run { name, command } => {
@@ -633,6 +674,10 @@ async fn run(cli: Cli) -> Result<()> {
                 match command.split_first() {
                     Some((program, args)) => workspace::exec(&path, program.as_ref(), args)?,
                     None => {
+                        anyhow::ensure!(
+                            !workspace::is_disabled(&path),
+                            "Workspace '{name}' is disabled; run `codex-switcher workspace enable {name}` or `codex-switcher switch ACCOUNT -w {name}`"
+                        );
                         let codex = app_server::resolve_codex_bin(&cli.codex_bin, &path)
                             .with_context(|| {
                                 format!(

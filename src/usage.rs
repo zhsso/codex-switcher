@@ -15,6 +15,8 @@ pub struct AccountUsage {
     pub id: String,
     pub name: String,
     pub is_active: bool,
+    /// Workspaces logged in to this account.
+    pub workspaces: Vec<String>,
     pub status: &'static str,
     pub plan_type: Option<String>,
     pub windows: Vec<UsageWindow>,
@@ -238,6 +240,7 @@ async fn query_with_client(
     client: &UsageClient,
 ) -> Result<Vec<AccountUsage>> {
     let store = accounts::load_current(storage)?;
+    let logins = crate::workspace::logins(storage);
     let selected = match selector {
         Some(selector) => vec![&store.accounts[accounts::resolve(&store, selector)?]],
         None => store.accounts.iter().collect(),
@@ -248,6 +251,7 @@ async fn query_with_client(
             id: account.id.clone(),
             name: account.name.clone(),
             is_active: store.active_account_id.as_deref() == Some(&account.id),
+            workspaces: accounts::workspaces_using(account, &logins),
             status: "ok",
             plan_type: None,
             windows: Vec::new(),

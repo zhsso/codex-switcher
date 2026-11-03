@@ -107,6 +107,15 @@ pub fn account_for_auth<'a>(
     matches.next().is_none().then_some(account)
 }
 
+/// The names of the workspaces logged in to this account, from `workspace::logins`.
+pub fn workspaces_using(account: &StoredAccount, logins: &[(String, AuthDotJson)]) -> Vec<String> {
+    logins
+        .iter()
+        .filter(|(_, auth)| matches_auth(account, auth))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// Other Codex homes currently logged in to this account.
 pub fn peer_homes_using(storage: &Storage, account: &StoredAccount) -> Vec<PathBuf> {
     workspace::peer_auths(storage)
@@ -267,6 +276,7 @@ async fn switch_target(storage: &Storage, selector: Option<&str>) -> Result<Stri
         return Err(error);
     }
     storage.write_auth(&account)?;
+    workspace::clear_disabled(&storage.codex_home)?;
     store.active_account_id = Some(account.id.clone());
     store.accounts[index].last_used_at = Some(chrono::Utc::now());
     storage.save(&store)?;

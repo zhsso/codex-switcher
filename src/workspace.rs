@@ -18,6 +18,8 @@ use crate::types::AuthDotJson;
 use crate::{accounts, app_server, config, processes};
 
 const MARKER: &str = ".codex-switcher-workspace.json";
+/// Remembers which account a disabled workspace released. Holds no credentials.
+const DISABLED: &str = ".codex-switcher-disabled.json";
 pub const DEFAULT: &str = "default";
 
 /// Read-mostly customizations that should stay the same in every home. Packages
@@ -39,12 +41,20 @@ struct Marker {
     created_at: DateTime<Utc>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct Disabled {
+    account_id: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct WorkspaceInfo {
     pub name: String,
     pub account: Option<String>,
     pub path: PathBuf,
     pub current: bool,
+    pub disabled: bool,
+    /// The account `enable` would restore.
+    pub disabled_account: Option<String>,
 }
 
 fn root(storage: &Storage) -> PathBuf {
@@ -162,6 +172,34 @@ pub fn exec(path: &Path, program: &OsStr, args: &[String]) -> Result<()> {
     }
 }
 
+/// The login of every workspace, by name. An explicit Codex directory that is
+/// not a workspace is reported as `current`.
+pub fn logins(storage: &Storage) -> Vec<(String, AuthDotJson)> {
+    let mut homes: Vec<_> = Storage::default_codex_home()
+        .ok()
+        .map(|home| (DEFAULT.to_owned(), home))
+        .into_iter()
+        .chain(
+            workspaces(storage)
+                .into_iter()
+                .map(|(name, path, _)| (name, path)),
+        )
+        .collect();
+    if !homes
+        .iter()
+        .any(|(_, home)| same_path(home, &storage.codex_home))
+    {
+        homes.push(("current".to_owned(), storage.codex_home.clone()));
+    }
+    homes
+        .into_iter()
+        .filter_map(|(name, home)| {
+            let auth = storage.with_home(home).read_auth().ok()??;
+            Some((name, auth))
+        })
+        .collect()
+}
+
 /// The default workspace first, then the others by name.
 pub fn list(storage: &Storage) -> Result<Vec<WorkspaceInfo>> {
     let store = storage.load()?;
@@ -173,6 +211,11 @@ pub fn list(storage: &Storage) -> Result<Vec<WorkspaceInfo>> {
         .chain(others)
         .map(|(name, path)| {
             let auth = storage.with_home(path.clone()).read_auth().ok().flatten();
+            let disabled = is_disabled(&path);
+            let disabled_account = read_disabled(&path).filter(|_| disabled).and_then(|state| {
+                let account = store.accounts.iter().find(|a| a.id == state.account_id)?;
+                Some(account.name.clone())
+            });
             WorkspaceInfo {
                 name,
                 account: auth.as_ref().and_then(|auth| {
@@ -180,6 +223,8 @@ pub fn list(storage: &Storage) -> Result<Vec<WorkspaceInfo>> {
                 }),
                 current: same_path(&path, &storage.codex_home),
                 path,
+                disabled,
+                disabled_account,
             }
         })
         .collect())
@@ -266,32 +311,103 @@ pub async fn create(
     }
 }
 
-/// Stop the workspace's daemon, save its rotated tokens, and delete it.
-pub fn remove(storage: &Storage, name: &str, codex_bin: &str) -> Result<()> {
-    anyhow::ensure!(name != DEFAULT, "Workspace '{DEFAULT}' cannot be removed");
+fn read_disabled(home: &Path) -> Option<Disabled> {
+    serde_json::from_slice(&fs::read(home.join(DISABLED)).ok()?).ok()
+}
+
+/// A login made by other means, such as `codex login`, re-enables a workspace.
+pub fn is_disabled(home: &Path) -> bool {
+    home.join(DISABLED).exists() && !home.join("auth.json").exists()
+}
+
+/// Forget that a workspace was disabled, once it is logged in again.
+pub fn clear_disabled(home: &Path) -> Result<()> {
+    match fs::remove_file(home.join(DISABLED)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("Failed to clear the disabled state"),
+    }
+}
+
+/// Stop the workspace's daemon and release its account for other workspaces.
+/// The daemon goes first, because it keeps tokens in memory and could still
+/// rotate them. Returns the released account's name.
+pub fn disable(storage: &Storage, name: &str, codex_bin: &str) -> Result<String> {
     let path = path(storage, name)?;
-    let running = processes::list_running(&path)?;
+    anyhow::ensure!(
+        !is_disabled(&path),
+        "Workspace '{name}' is already disabled"
+    );
+    let workspace = storage.with_home(path.clone());
+    // Check first: an unsaved login must not lose its daemon before being refused.
+    let release = |store: &crate::types::AccountsStore| -> Result<(String, String)> {
+        let auth = workspace
+            .read_auth()?
+            .with_context(|| format!("Workspace '{name}' is not logged in"))?;
+        let account = accounts::account_for_auth(store, &auth).with_context(|| {
+            format!("The login in workspace '{name}' is not a saved account; run `codex-switcher -w {name} add NAME` first")
+        })?;
+        Ok((account.id.clone(), account.name.clone()))
+    };
+    release(&accounts::load_current(&workspace)?)?;
+    stop_processes(&path, name, codex_bin)?;
+
+    // Save the tokens the daemon may have rotated before auth.json goes away.
+    let _lock = storage.lock()?;
+    let store = accounts::load_current(&workspace)?;
+    let (account_id, account_name) = release(&store)?;
+    storage.save(&store)?;
+    fs::write(
+        path.join(DISABLED),
+        serde_json::to_vec_pretty(&Disabled { account_id })?,
+    )?;
+    fs::remove_file(workspace.auth_path())?;
+    Ok(account_name)
+}
+
+/// Log a disabled workspace back in to the account it released. Fails, leaving
+/// it disabled, if another workspace has taken that account in the meantime.
+pub async fn enable(storage: &Storage, name: &str) -> Result<(PathBuf, String)> {
+    let path = path(storage, name)?;
+    anyhow::ensure!(is_disabled(&path), "Workspace '{name}' is not disabled");
+    let state = read_disabled(&path).with_context(|| {
+        format!("Could not read the disabled state; run `codex-switcher switch ACCOUNT -w {name}`")
+    })?;
+    let account = accounts::switch(&storage.with_home(path.clone()), &state.account_id).await?;
+    Ok((path, account))
+}
+
+/// Stop the daemon and its updater, refusing if clients are still running.
+fn stop_processes(path: &Path, name: &str, codex_bin: &str) -> Result<()> {
+    let running = processes::list_running(path)?;
     let clients = running
         .iter()
         .filter(|process| process.kind.is_closable() && !process.managed)
         .count();
     anyhow::ensure!(
         clients == 0,
-        "{clients} process(es) are still using workspace '{name}'; close them or run `CODEX_HOME={} codex-switcher stop`",
-        path.display()
+        "{clients} process(es) are still using workspace '{name}'; close them or run `codex-switcher -w {name} stop`"
     );
     if running
         .iter()
         .any(|process| process.managed && process.kind.is_closable())
     {
-        app_server::daemon_command(codex_bin, &path, "stop")?;
+        app_server::daemon_command(codex_bin, path, "stop")?;
     }
-    processes::stop_updaters(&path)?;
-    let remaining = processes::list_running(&path)?.len();
+    processes::stop_updaters(path)?;
+    let remaining = processes::list_running(path)?.len();
     anyhow::ensure!(
         remaining == 0,
         "{remaining} process(es) are still using workspace '{name}'; try again shortly"
     );
+    Ok(())
+}
+
+/// Stop the workspace's daemon, save its rotated tokens, and delete it.
+pub fn remove(storage: &Storage, name: &str, codex_bin: &str) -> Result<()> {
+    anyhow::ensure!(name != DEFAULT, "Workspace '{DEFAULT}' cannot be removed");
+    let path = path(storage, name)?;
+    stop_processes(&path, name, codex_bin)?;
 
     // Deleting the workspace's auth.json must not lose the only valid refresh token.
     let _lock = storage.lock()?;

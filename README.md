@@ -106,7 +106,7 @@ codex-switcher status <ID> --json      # 单个账号，仍返回 JSON 数组
 codex-switcher list                   # 本地账号列表，用于查看 ID
 ```
 
-终端输出按账号分组，带缩进和用量进度条：左侧红色表示已用比例，右侧绿色表示剩余比例；当前账号和重置倒计时使用青色。颜色自动适配终端，管道或重定向输出禁用颜色，支持 `NO_COLOR`。也可手动选择：
+终端输出按账号分组，带缩进和用量进度条：左侧红色表示已用比例，右侧绿色表示剩余比例；账号标题后的方括号显示正在使用它的 workspace（如 `[default]`、`[work]`），当前 workspace 的账号和重置倒计时使用青色。颜色自动适配终端，管道或重定向输出禁用颜色，支持 `NO_COLOR`。也可手动选择：
 
 ```sh
 codex-switcher status --color always
@@ -129,7 +129,7 @@ codex-switcher list --color never
 
 请求超时或接口异常按账号标记为 `error`，继续查询其他账号；有查询失败时退出码为 1，`--json` 的标准输出仍为完整的结果数组。没有账号时返回空数组。找不到指定账号时直接报错。
 
-查询优先使用当前本地凭据；遇到 HTTP 401 时重新读取凭据，必要时刷新并保存 token 后重试一次。HTTP 403 不触发刷新。查询不会切换当前账号、启动后台监控或发送预热请求。仅当刷新的是当前账号时同步其 `auth.json`。
+查询优先使用当前本地凭据；遇到 HTTP 401 时重新读取凭据，必要时刷新并保存 token 后重试一次。HTTP 403 不触发刷新。查询不会切换当前账号、启动后台监控或发送预热请求。刷新后同步到正在使用该账号的 workspace 的 `auth.json`。
 
 `list`（也可用 `ls`）保留本地凭据状态与本地套餐信息，不联网、不写入文件。`status` 和 `list` 均不输出密钥或 token。
 
@@ -164,6 +164,8 @@ codex-switcher workspace shell work                   # 进入子 shell，其中
 codex-switcher -w work status              # -w 可用于任何命令，如 ps、stop、status
 codex-switcher workspace list              # 查看每个 workspace 使用的账号，* 为当前
 codex-switcher workspace path work         # 输出目录，可用于 export CODEX_HOME=...
+codex-switcher workspace disable work      # 停止其 daemon 并释放账号，会话和配置保留
+codex-switcher workspace enable work       # 恢复 disable 时的账号；也可 switch 其他账号 -w work
 codex-switcher workspace remove work       # 停止其 daemon 并删除，包括其中的会话；-y/--yes 跳过确认
 ```
 
@@ -176,7 +178,9 @@ codex-switcher workspace remove work       # 停止其 daemon 并删除，包括
 - **共享（符号链接）：** `skills`、`plugins`、`vendor_imports`、`rules`、`prompts`、`agents`、`AGENTS.md`、`AGENTS.override.md`。
 - **daemon：** 首次启动时由 Codex 把自己安装到该 workspace 的 `packages` 中（当前版本约 436 MB），不与其他目录共享。
 
-OAuth refresh token 会轮换，同一账号在两个目录同时使用会互相顶掉登录，因此已被其他 workspace 使用的账号无法 `switch`，不带参数的 `switch` 也会跳过它们；需要时先把占用方切到其他账号。API key 账号不受限制。账号命令会从所有 workspace 及其来源目录收集轮换后的 token，刷新后也会写回正在使用该账号的目录。不要在 workspace 里用 `codex login` 登录已在别处使用的账号，这一点无法拦截。
+OAuth refresh token 会轮换，同一账号在两个目录同时使用会互相顶掉登录，因此已被其他 workspace 使用的账号无法 `switch`，不带参数的 `switch` 也会跳过它们；需要时先把占用方切到其他账号，或用 `workspace disable` 释放。API key 账号不受限制。账号命令会从所有 workspace 及其来源目录收集轮换后的 token，刷新后也会写回正在使用该账号的目录。不要在 workspace 里用 `codex login` 登录已在别处使用的账号，这一点无法拦截。
+
+`workspace disable` 保存 token 后移走该 workspace 的 `auth.json`，并停止其 daemon 和 updater；仍有客户端运行、未登录或登录的不是已保存账号时会拒绝。之后 `workspace enable` 恢复原账号（若已被占用则报错并保持 disabled），`switch ACCOUNT -w 名称` 可改用其他账号。disabled 期间 `workspace run` 不会启动 codex。
 
 在 Linux 上，`ps`、`stop` 和 `switch` 的重启只处理当前 Codex 目录的进程（读取 `/proc/<pid>/environ` 中的 `CODEX_HOME`）。
 
